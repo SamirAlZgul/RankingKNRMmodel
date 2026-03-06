@@ -14,7 +14,7 @@ class KNRM(torch.nn.Module):
         KNRM (Kernel-based Neural Ranking Model) - нейросетевая модель для ранжирования документов
         Использует ядра гаусса для моделирования совпадений на разных уровнях точности
     """
-    def __init__(self, kernel_num=21, sigma=0.1, exact_sigma=0.001):
+    def __init__(self, kernel_num=21, sigma=0.1, exact_sigma=0.001, out_layers=[]):
         """
             Args:
             kernel_num: количество ядер (по умолчанию 21, как в оригинальной статье)
@@ -24,7 +24,7 @@ class KNRM(torch.nn.Module):
         self.kernel_num = kernel_num
         self.sigma = sigma
         self.exact_sigma = exact_sigma
-
+        self.out_layers = out_layers
         self.kernels = self._get_kernels_layers()
 
 
@@ -79,6 +79,41 @@ class KNRM(torch.nn.Module):
             KM.append(K) # список из тензора размера batch_size,
         kernels_out = torch.stack(KM, dim=1) # (batch_size, self.kernels)
         return kernels_out
+
+
+    def _get_mlp(self):
+        # задаем выходное значение [21 ядро] + [] + [1]
+        out_cont = [self.kernel_num] + self.out_layers + [1]
+        # создаем список из слоев сдвинутых на 1
+        # [21,128,64,1], [128,64],[64,1]
+        '''
+        как пример
+        Sequential(
+        (0): Sequential(  # Вход: 21
+                (0): Linear(21 -> 128)
+                (1): ReLU()
+            )
+            (1): Sequential(  # Скрытый слой: 128 -> 64
+                (0): Linear(128 -> 64)
+                (1): ReLU()
+            )
+            (2): Sequential(  # Выходной слой: 64 -> 1 (без ReLU)
+                (0): Linear(64 -> 1)
+            )
+        )
+        '''
+        mlp = [
+            torch.nn.Sequential(
+                torch.nn.Linear(in_f, out_f),
+                torch.nn.ReLU()) for in_f, out_f in zip(out_cont, out_cont[1:])
+        ]
+        # берем последний блок и удаляем из него последний ReLU(), чтобы на выходе
+        # был только линейный слой
+        # это важно чтобы оценки релевантности не были ограничены сверху
+        # отрицательные значения тоже важны
+        mlp[-1] = mlp[-1][:-1]
+        # Распаковывает список слоев и объединяет их в единую Sequential модель
+        return torch.nn.Sequential(*mlp)
 
 
 
