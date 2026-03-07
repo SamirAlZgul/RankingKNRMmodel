@@ -115,6 +115,17 @@ class KNRM(torch.nn.Module):
         # Распаковывает список слоев и объединяет их в единую Sequential модель
         return torch.nn.Sequential(*mlp)
 
+    def forward(self, inputs):
+        # получаем запрос пользователя и документ
+        query, doc = inputs['query'], inputs['document']
+        # формируем матрицу матчинга
+        matching_matrix = self._get_matching_matrix(query, doc)
+        # спулим матрицу матчинга ядрами Гаусса
+        kernels_out = self._apply_kernels(matching_matrix)
+        # получаем выходное значение релевантности для каждой пары запрос и документ в батче
+        out = self.mlp(kernels_out)
+        return out
+
 
 
 
