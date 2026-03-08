@@ -14,18 +14,33 @@ class KNRM(torch.nn.Module):
         KNRM (Kernel-based Neural Ranking Model) - нейросетевая модель для ранжирования документов
         Использует ядра гаусса для моделирования совпадений на разных уровнях точности
     """
-    def __init__(self, kernel_num=21, sigma=0.1, exact_sigma=0.001, out_layers=[]):
+    def __init__(self,
+                 emb_path,
+                 mlp_path,
+                 kernel_num=21,
+                 sigma=0.1,
+                 exact_sigma=0.001,
+                 out_layers=[]):
         """
             Args:
             kernel_num: количество ядер (по умолчанию 21, как в оригинальной статье)
             sigma: стандартное отклонение для ядер Гаусса
         """
         super(KNRM, self).__init__()
+        self.embeddings = torch.nn.Embedding.from_pretrained(
+            torch.load(emb_path)['weight'],
+            freeze=True,
+            padding_idx=0
+        )
         self.kernel_num = kernel_num
         self.sigma = sigma
         self.exact_sigma = exact_sigma
         self.out_layers = out_layers
         self.kernels = self._get_kernels_layers()
+        self.mlp = self._get_mlp()
+        # передаем в MLP веса на слои - инициализируем их
+        self.mlp.load_state_dict(torch.load(mlp_path))
+        self.out_activation = torch.nn.Sigmoid()
 
 
     def _get_kernels_layers(self):
@@ -57,13 +72,14 @@ class KNRM(torch.nn.Module):
         косинусное сходство между i-тым словом запроса и j-тым словом документа в b-том примере
         (используем построение матрицы в нотации Эйнштейна)
         """
-        embed_query = self.embedding(query)
-        embed_doc = self.embedding(doc)
+        embed_query = self.embeddings(query)
+        embed_doc = self.embeddings(doc)
         matching_matrix = torch.einsum(
             'BWD, BRD->BWR',
             F.normalize(embed_query, p=2, dim=-1),
             F.normalize(embed_doc, p=2, dim=-1)
         )
+        return matching_matrix
 
     def _apply_kernels(self, matching_matrix):
         KM = []
@@ -124,8 +140,66 @@ class KNRM(torch.nn.Module):
         kernels_out = self._apply_kernels(matching_matrix)
         # получаем выходное значение релевантности для каждой пары запрос и документ в батче
         out = self.mlp(kernels_out)
+        out = self.out_activation(out)
         return out
 
 
+#Testing --------------------------------------------------------------------------------------------------------
+# from torchtext.vocab import GloVe
+# glove = GloVe(name='6B', dim=300)
+# embeddings = glove.vectors
+# padding = torch.zeros(1, 300)
+# embeddings = torch.cat([padding, embeddings], dim=0)
+# torch.save({'weight': embeddings}, 'glove_embeddings.pt')
+# print(f"Эмбеддинги сохранены, размер: {embeddings.shape}")
 
+# Testing data creation
+# batch_size = 4
+# query_len = 5
+# doc_len = 10
+# vocab_size = 1000
+#
+# query = torch.randint(1, vocab_size, size=(batch_size, query_len))
+# doc = torch.randint(1, vocab_size, size=(batch_size, doc_len))
+#
+# out_layers = [128,64]
+# kernel_num = 21
+# # [21,128,64,1]
+# layer_dims = [kernel_num] + out_layers + [1]
+#
+# # Creation weights for mlp layers and loading weights
+# mlp_state_dict = {}
+# for i in range(len(layer_dims) - 1):
+#     # Веса для линейного слоя
+#     mlp_state_dict[f'{i}.0.weight'] = torch.randn(layer_dims[i+1], layer_dims[i])
+#     mlp_state_dict[f'{i}.0.bias'] = torch.randn(layer_dims[i+1])
+#
+# # Сохраняем тестовый MLP
+# torch.save(mlp_state_dict, 'test_mlp.pt')
 
+model = KNRM(
+    emb_path='glove_embeddings.pt',
+    mlp_path='test_mlp.pt',
+    kernel_num=21,
+    sigma=0.1,
+    exact_sigma=0.001,
+    out_layers=[128, 64]
+)
+
+model.eval()
+
+batch_size = 4
+query_len = 5
+doc_len = 10
+vocab_size = 1000
+
+query = torch.randint(1, vocab_size, size=(batch_size, query_len))
+doc = torch.randint(1, vocab_size, size=(batch_size, doc_len))
+
+with torch.no_grad():
+    inputs = {
+        'query': query,
+        'document': doc
+    }
+    output = model(inputs)
+    print(output)
