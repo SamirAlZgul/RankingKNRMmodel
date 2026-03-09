@@ -144,6 +144,8 @@ class KNRM(torch.nn.Module):
         return out
 
 
+
+
 #Testing --------------------------------------------------------------------------------------------------------
 # from torchtext.vocab import GloVe
 # glove = GloVe(name='6B', dim=300)
