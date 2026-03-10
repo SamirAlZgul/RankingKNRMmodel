@@ -3,6 +3,7 @@
 будем обучать правильно рандировать документы, для этого надо написать все функции по формированию документов
 '''
 import pandas as pd
+import numpy as np
 from pandas import read_csv
 from datasets import load_dataset
 
@@ -17,7 +18,8 @@ class Solution:
         # надо взять отдельно трейн и тест
         self.glue_train_df = self._get_glue_df('train')
         self.glue_dev_df = self._get_glue_df('dev')
-
+        # теперь из этого надо создать валидационный набор
+        self.dev_pairs_for_ndcg = self._create_val_pairs(self.glue_dev_df)
 
     # напишем функцию, которая читает трейн и text-файлы c лейблами
     def _get_glue_df(self, partition_type):
@@ -30,6 +32,64 @@ class Solution:
                                     'text_right':glue_df['question2'],
                                     'label':glue_df['is_duplicate']})
         return glue_df_fin
+
+    # напишем функцию, которая формирует набор, на ктором будем валидировать обученную модель
+    def _create_val_pairs(self, inp_df, fill_top_to=15, min_group_size=1, seed = 0):
+        # на вход приходит датасет inp_df
+        inp_df['label'] = inp_df['label'].astype('int64')
+        # выбираем айдишники и лейблы - мы всегда восстановим по айдишникам сами текста
+        inp_df_select = inp_df[['id_left','id_right','label']]
+        # смотрим сколько вообще сэмплов в каждой id-группе
+        inp_df_group_sizes = inp_df_select.groupby('id_left').size()
+        print("inp_df_group_sizes", inp_df_group_sizes)
+        # теперь выбираем конкретные айдишники текстов с левой колонки - id_left где записей больше 2
+        # это нужно, чтобы сделать каждую группу хотя бы минимально представительной
+        glue_dev_leftids_to_use = list(inp_df_group_sizes[inp_df_group_sizes >= min_group_size].index)
+        print("glue_dev_leftids_to_use", glue_dev_leftids_to_use)
+        # теперь выбираем из изначального датасета только представительные номера, которые обозначили на предыдущем шаге
+        groups = inp_df_select[inp_df_select.id_left.isin(glue_dev_leftids_to_use)].groupby('id_left')
+        # получаем список всех ids (правый не фильтруем так как id - симметричные)
+        all_ids = set(inp_df['id_left']).union(set(inp_df['id_right']))
+        #print("all_ids", all_ids)
+        np.random.seed(seed)
+        out_pairs = []
+        pad_sample = []
+        print('groups',groups)
+        for id_left, group in groups:
+            print('sampling')
+            # для каждого id_left выбираем все пары релевантных документов
+            ones_ids = group[group.label>0].id_right.values
+            # и все пары нерелеватных документов
+            zeroes_ids = group[group.label==0].id_left.values
+            # теперь смотрим их количество
+            sum_len = len(ones_ids)+len(zeroes_ids)
+            # теперь смотрим, сколько пар в каждую группу надо добавить для того ,чтобы избежать дисбаланса в группах
+            # то есть чтобы везде было по 15 сэмплов
+            # это нужно для стабильности обучения, бат-обработки и т д
+            num_pad_items = max(0, fill_top_to-sum_len)
+            if num_pad_items>0:
+                # если к текущей группе нужно добавить сколько то семплов до 15
+                # то выбираем элементы которые надо добавить
+                # это вот все которые на текущем шаге выбраны - их нельзя боать
+                cur_chosen = set(ones_ids).union(set(zeroes_ids)).union(id_left)
+                # из остальных рандомно добираем пары ids
+                pad_sample = list(np.random.choice(list(all_ids-cur_chosen), num_pad_items, replace=False))
+            else:
+                pad_sample=[]
+            # теперь мы получили для конкретного id_left все 15 пар - надо семплировать
+            for i in ones_ids:
+                out_pairs.append([id_left,i,2])
+            for i in zeroes_ids:
+                out_pairs.append([id_left,i,1])
+            for i in pad_sample:
+                out_pairs.append([id_left,i,0])
+        return out_pairs
+
+
+
+
+
+
 
 
 
@@ -56,7 +116,12 @@ class Solution:
 # save_glue_format('dev', dataset["validation"].to_pandas(), './dev.tsv')
 
 
+# Testing formating df-s
+sol = Solution("./")
+dat = sol.glue_train_df
+print(dat[['text_right','label']].head(4))
+print(dat.columns)
 
-# sol = Solution("./")
-# dat = sol.glue_train_df
-# print(dat.head(4))
+# Testing formating val_dataset
+print('sol.dev_pairs_for_ndcg', sol.dev_pairs_for_ndcg)
+
