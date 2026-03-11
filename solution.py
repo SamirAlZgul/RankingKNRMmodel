@@ -5,10 +5,15 @@
 import pandas as pd
 import numpy as np
 from pandas import read_csv
+
+import string
+import nltk
+from collections import Counter
 from datasets import load_dataset
 
 class Solution:
-    def __init__(self, glue_qqp_dir):
+    def __init__(self, glue_qqp_dir,
+                 min_occurancies = 1):
 
 
         # путь до папки с трейном и тестом
@@ -20,6 +25,8 @@ class Solution:
         self.glue_dev_df = self._get_glue_df('dev')
         # теперь из этого надо создать валидационный набор
         self.dev_pairs_for_ndcg = self._create_val_pairs(self.glue_dev_df)
+
+        self.min_occurancies = min_occurancies
 
     # напишем функцию, которая читает трейн и text-файлы c лейблами
     def _get_glue_df(self, partition_type):
@@ -85,6 +92,47 @@ class Solution:
                 out_pairs.append([id_left,i,0])
         return out_pairs
 
+    #напишем функцию, которая правильно фильтрует полученные датасеты: убираем знаки препинания, формирует нижний
+    #регистр и пр.
+    def _get_all_tokens(self, list_of_df, min_occurancies):
+        tokens=[]
+        # проходимся по каждому датасету
+        for df in list_of_df:
+            unique_texts = set(df[['text_left','text_right']].values.reshape(-1))
+            # склеиваем все тексты в одну строку
+            unique_texts = str(' '.join(unique_texts))
+            # предобрабатывваем ве тексты и токенизируем их
+            df_tokens = self._simple_preproc(unique_texts)
+            tokens.extend(df_tokens)
+        # далее из общего списка, надо убрать редкие слова, чтобы модель не зацикливалась на них
+        count_filtered = self._filter_rare_words(Counter(tokens), min_occurancies)
+        # поулчаем словарь с убранными редкими токенами, которые встречаются реже, чем min_occurancies
+        return list(count_filtered.keys())
+
+    # здесь функция которая для каждого текста убираем лишние пробелы и вызывает функцию удаления знаков пунктуации
+    # и далее токенизирует слова
+    def _simple_preproc(self, inp_str):
+        base_str = inp_str.strip().lower()
+        str_wo_punct = self._handle_punctuation(base_str)
+        return nltk.word_tokenize(str_wo_punct)
+
+    # функция, которая убирает все знаки пунктуации
+    def _handle_punctuation(self, inp_str):
+        inp_str = str(inp_str)
+        for punct in string.punctuation:
+            inp_str = inp_str.replace(punct,'')
+        return inp_str
+
+    # функция, которая убирает редкие слова проходясь по словарю
+    def _filter_rare_words(self, vocab, min_occurancies):
+        out_vocab = dict()
+        for word, cnt in vocab.items():
+            if cnt>min_occurancies:
+                out_vocab[word] = cnt
+        return out_vocab
+
+
+
 
 
 
@@ -115,13 +163,43 @@ class Solution:
 # save_glue_format('train', dataset["train"].to_pandas(), './train.tsv')
 # save_glue_format('dev', dataset["validation"].to_pandas(), './dev.tsv')
 
+try:
+    # Пробуем новый вариант
+    nltk.data.find('tokenizers/punkt_tab')
+    print("Ресурс punkt_tab уже загружен")
+except LookupError:
+    print("Загружаем punkt_tab...")
+    nltk.download('punkt_tab')
 
-# Testing formating df-s
-sol = Solution("./")
-dat = sol.glue_train_df
-print(dat[['text_right','label']].head(4))
-print(dat.columns)
+# Создаем объект, но подменяем атрибуты после создания
+sol = Solution.__new__(Solution)  # создаем объект без вызова __init__
+sol.glue_qqp_dir = None
+sol.min_occurancies = 1
 
-# Testing formating val_dataset
-print('sol.dev_pairs_for_ndcg', sol.dev_pairs_for_ndcg)
+# Теперь вручную создаем тестовые датафреймы
+test_df = pd.DataFrame({
+    'text_left': [
+        'Hello world!',           # слово Hello встречается
+        'Hello Python!',           # слово Hello встречается снова
+        'Python programming'       # слово Python встречается снова
+    ],
+    'text_right': [
+        'Hello world again!',      # Hello и world
+        'Python is great',
+        'Python'                 # Python
+    ]
+})
+
+# Присваиваем тестовые датафреймы
+sol.glue_train_df = test_df
+sol.glue_dev_df = test_df.copy()
+
+# Теперь можно тестировать методы
+print("="*60)
+print("ТЕСТИРОВАНИЕ НА МАЛЕНЬКОМ ДАТАСЕТЕ")
+print("="*60)
+
+# Тестируем _get_all_tokens
+tokens_1 = sol._get_all_tokens([sol.glue_train_df], min_occurancies=2)
+print(f"\nmin_occurancies=1: {sorted(tokens_1)}")
 
