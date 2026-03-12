@@ -10,16 +10,22 @@ import string
 import nltk
 from collections import Counter
 from datasets import load_dataset
+glove_vectors_path = "glove.6B/glove.6B.50d.txt"
 
 class Solution:
     def __init__(self, glue_qqp_dir,
-                 min_occurancies = 1):
+                 glove_vectors_path,
+                 min_occurancies = 1,
+                 random_seed = 0,
+                 emb_rand_uni_bound = 0.2,
+                 freeze_knrm_embeddings = True,
+                 ):
 
 
         # путь до папки с трейном и тестом
         self.glue_qqp_dir = glue_qqp_dir
         # путь до файла с эмбеддингами
-        #self.glove_vectors_path = glove_vectors_path
+        self.glove_vectors_path = glove_vectors_path
         # надо взять отдельно трейн и тест
         self.glue_train_df = self._get_glue_df('train')
         self.glue_dev_df = self._get_glue_df('dev')
@@ -27,6 +33,12 @@ class Solution:
         self.dev_pairs_for_ndcg = self._create_val_pairs(self.glue_dev_df)
 
         self.min_occurancies = min_occurancies
+        self.all_tokens = self._get_all_tokens(self.glue_train_df, self.min_occurancies)
+
+        self.random_seed = random_seed
+        self.emb_rand_uni_bound = emb_rand_uni_bound
+        self.freeze_embeddings = freeze_knrm_embeddings
+
 
     # напишем функцию, которая читает трейн и text-файлы c лейблами
     def _get_glue_df(self, partition_type):
@@ -132,6 +144,28 @@ class Solution:
         return out_vocab
 
 
+    def _read_glove_embeddings(self,file_path):
+        embedding_data = {}
+        with open(file_path, 'r', encoding='utf-8') as f:
+            for line in f:
+                current_line = line.rstrip().split(' ')
+                embedding_data[current_line[0]] = current_line[1:]
+        return embedding_data
+
+
+    def _create_glove_emb_from_file(self, file_path, inner_keys, random_seed, rand_uni_bound):
+        glove_emb = self._read_glove_embeddings(file_path)
+        inner_keys = ['PAD', 'OOV'] + inner_keys
+        print(glove_emb)
+        return glove_emb
+
+
+
+    # def _build_knrm_model(self):
+    #     emb_matrix, vocab, unk_words = self.create_glove_emb_from_file(self.glove_vectors_path,
+    #                                                                    self.all_tokens)
+
+
 
 
 
@@ -199,7 +233,24 @@ print("="*60)
 print("ТЕСТИРОВАНИЕ НА МАЛЕНЬКОМ ДАТАСЕТЕ")
 print("="*60)
 
-# Тестируем _get_all_tokens
-tokens_1 = sol._get_all_tokens([sol.glue_train_df], min_occurancies=2)
-print(f"\nmin_occurancies=1: {sorted(tokens_1)}")
+# # Тестируем _get_all_tokens
+# tokens_1 = sol._get_all_tokens([sol.glue_train_df], min_occurancies=2)
+# print(f"\nmin_occurancies=1: {sorted(tokens_1)}")
 
+#TESTING get GLOVE embeddings
+#TESTING get GLOVE embeddings
+sol = Solution.__new__(Solution)  # создаем объект без вызова __init__
+sol.glue_qqp_dir = None
+sol.min_occurancies = 1
+
+# Создаем тестовые данные
+test_tokens = ['hello', 'world', 'python', 'programming']
+
+# Вызываем функцию со всеми аргументами
+result = sol._create_glove_emb_from_file(
+    file_path="glove.6B/glove.6B.50d.txt",
+    inner_keys=test_tokens,
+    random_seed=42,
+    rand_uni_bound=0.2
+)
+print(result)
