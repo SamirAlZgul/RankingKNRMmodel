@@ -33,7 +33,7 @@ class Solution:
         self.dev_pairs_for_ndcg = self._create_val_pairs(self.glue_dev_df)
 
         self.min_occurancies = min_occurancies
-        self.all_tokens = self._get_all_tokens(self.glue_train_df, self.min_occurancies)
+        self.all_tokens = self._get_all_tokens([self.glue_train_df,self.glue_dev_df], self.min_occurancies)
 
         self.random_seed = random_seed
         self.emb_rand_uni_bound = emb_rand_uni_bound
@@ -75,7 +75,6 @@ class Solution:
         pad_sample = []
         print('groups',groups)
         for id_left, group in groups:
-            print('sampling')
             # для каждого id_left выбираем все пары релевантных документов
             ones_ids = group[group.label>0].id_right.values
             # и все пары нерелеватных документов
@@ -156,14 +155,34 @@ class Solution:
     def _create_glove_emb_from_file(self, file_path, inner_keys, random_seed, rand_uni_bound):
         glove_emb = self._read_glove_embeddings(file_path)
         inner_keys = ['PAD', 'OOV'] + inner_keys
-        print(glove_emb)
-        return glove_emb
+        # коиличество строк в матрице = количество слов
+        high_matrix = len(inner_keys)
+        # размерность эмбеддинга
+        len_matrix = len(list(glove_emb.values())[0])
+        print(high_matrix)
+        print(len_matrix)
+
+        matrix = np.empty((high_matrix, len_matrix))
+        vocab = dict()
+        unk_words = []
+        np.random.seed(random_seed)
+        # проходимся по словам
+        for idx, word in enumerate(inner_keys):
+            vocab[word] = idx
+            if word in glove_emb:
+                matrix[idx] = glove_emb[word]
+            else:
+                unk_words.append(word)
+                matrix[idx] = np.random.uniform(-rand_uni_bound, rand_uni_bound, size=len_matrix)
+        return matrix, vocab, unk_words
 
 
 
-    # def _build_knrm_model(self):
-    #     emb_matrix, vocab, unk_words = self.create_glove_emb_from_file(self.glove_vectors_path,
-    #                                                                    self.all_tokens)
+    def _build_knrm_model(self):
+        emb_matrix, vocab, unk_words = self._create_glove_emb_from_file(self.glove_vectors_path,
+                                                                       self.all_tokens, self.random_seed,
+                                                                       self.emb_rand_uni_bound)
+        return emb_matrix, vocab, unk_words
 
 
 
@@ -197,41 +216,41 @@ class Solution:
 # save_glue_format('train', dataset["train"].to_pandas(), './train.tsv')
 # save_glue_format('dev', dataset["validation"].to_pandas(), './dev.tsv')
 
-try:
-    # Пробуем новый вариант
-    nltk.data.find('tokenizers/punkt_tab')
-    print("Ресурс punkt_tab уже загружен")
-except LookupError:
-    print("Загружаем punkt_tab...")
-    nltk.download('punkt_tab')
-
-# Создаем объект, но подменяем атрибуты после создания
-sol = Solution.__new__(Solution)  # создаем объект без вызова __init__
-sol.glue_qqp_dir = None
-sol.min_occurancies = 1
-
-# Теперь вручную создаем тестовые датафреймы
-test_df = pd.DataFrame({
-    'text_left': [
-        'Hello world!',           # слово Hello встречается
-        'Hello Python!',           # слово Hello встречается снова
-        'Python programming'       # слово Python встречается снова
-    ],
-    'text_right': [
-        'Hello world again!',      # Hello и world
-        'Python is great',
-        'Python'                 # Python
-    ]
-})
+# try:
+#     # Пробуем новый вариант
+#     nltk.data.find('tokenizers/punkt_tab')
+#     print("Ресурс punkt_tab уже загружен")
+# except LookupError:
+#     print("Загружаем punkt_tab...")
+#     nltk.download('punkt_tab')
+#
+# # Создаем объект, но подменяем атрибуты после создания
+# sol = Solution.__new__(Solution)  # создаем объект без вызова __init__
+# sol.glue_qqp_dir = None
+# sol.min_occurancies = 1
+#
+# # Теперь вручную создаем тестовые датафреймы
+# test_df = pd.DataFrame({
+#     'text_left': [
+#         'Hello world!',           # слово Hello встречается
+#         'Hello Python!',           # слово Hello встречается снова
+#         'Python programming'       # слово Python встречается снова
+#     ],
+#     'text_right': [
+#         'Hello world again!',      # Hello и world
+#         'Python is great',
+#         'Python'                 # Python
+#     ]
+# })
 
 # Присваиваем тестовые датафреймы
-sol.glue_train_df = test_df
-sol.glue_dev_df = test_df.copy()
-
-# Теперь можно тестировать методы
-print("="*60)
-print("ТЕСТИРОВАНИЕ НА МАЛЕНЬКОМ ДАТАСЕТЕ")
-print("="*60)
+# sol.glue_train_df = test_df
+# sol.glue_dev_df = test_df.copy()
+#
+# # Теперь можно тестировать методы
+# print("="*60)
+# print("ТЕСТИРОВАНИЕ НА МАЛЕНЬКОМ ДАТАСЕТЕ")
+# print("="*60)
 
 # # Тестируем _get_all_tokens
 # tokens_1 = sol._get_all_tokens([sol.glue_train_df], min_occurancies=2)
@@ -239,18 +258,36 @@ print("="*60)
 
 #TESTING get GLOVE embeddings
 #TESTING get GLOVE embeddings
-sol = Solution.__new__(Solution)  # создаем объект без вызова __init__
-sol.glue_qqp_dir = None
-sol.min_occurancies = 1
+# sol = Solution.__new__(Solution)  # создаем объект без вызова __init__
+# sol.glue_qqp_dir = None
+# sol.min_occurancies = 1
+#
+# # Создаем тестовые данные
+# test_tokens = ['hello', 'world', 'python', 'programming']
 
-# Создаем тестовые данные
-test_tokens = ['hello', 'world', 'python', 'programming']
-
-# Вызываем функцию со всеми аргументами
-result = sol._create_glove_emb_from_file(
-    file_path="glove.6B/glove.6B.50d.txt",
-    inner_keys=test_tokens,
-    random_seed=42,
-    rand_uni_bound=0.2
+sol = Solution(
+    glue_qqp_dir="glue_qqp/",  # путь к папке с данными GLUE QQP
+    glove_vectors_path="glove.6B/glove.6B.50d.txt",  # путь к GloVe эмбеддингам
+    min_occurancies=1,
+    random_seed=0,
+    emb_rand_uni_bound=0.2,
+    freeze_knrm_embeddings=True
 )
-print(result)
+
+print("sol", sol)
+
+
+emb_matrix, vocab, unk_words = sol._build_knrm_model()
+
+print(f"Форма матрицы эмбеддингов: {emb_matrix.shape}")
+print(f"Размер словаря: {len(vocab)}")
+print(f"Количество неизвестных слов: {len(unk_words)}")
+if len(unk_words) > 0:
+    print(f"Примеры неизвестных слов: {unk_words[:10]}")
+print(f"Пример словаря (первые 5 слов): {list(vocab.items())[:5]}")
+print(f"Тип данных матрицы: {emb_matrix.dtype}")
+print(f"Несколько значений из матрицы: {emb_matrix[0, :5]}")
+
+print("\n" + "="*50)
+print("ТЕСТИРОВАНИЕ ЗАВЕРШЕНО")
+print("="*50)
