@@ -4,6 +4,7 @@
 '''
 import pandas as pd
 import numpy as np
+import torch
 from pandas import read_csv
 
 import string
@@ -12,6 +13,9 @@ from collections import Counter
 from datasets import load_dataset
 glove_vectors_path = "glove.6B/glove.6B.50d.txt"
 
+# импортируем описанную модель KNRM
+from main import KNRM
+
 class Solution:
     def __init__(self, glue_qqp_dir,
                  glove_vectors_path,
@@ -19,6 +23,11 @@ class Solution:
                  random_seed = 0,
                  emb_rand_uni_bound = 0.2,
                  freeze_knrm_embeddings = True,
+                 knrm_kernel_num = 21,
+                 knrm_out_mlp = [],
+                 dataloader_bs = 1024,
+                 train_lr = 0.001,
+                 change_train_loader_ep = 10
                  ):
 
 
@@ -38,6 +47,26 @@ class Solution:
         self.random_seed = random_seed
         self.emb_rand_uni_bound = emb_rand_uni_bound
         self.freeze_embeddings = freeze_knrm_embeddings
+        self.knrm_kernel_num = knrm_kernel_num
+        self.knrm_out_mlp = knrm_out_mlp
+        self.dataloader_bs = dataloader_bs
+        self.train_lr = train_lr
+        self.change_train_loader_ep = change_train_loader_ep
+        # получаем модель инициализированную, словарь слов и словарь редких слов, для которых нет эмбеддингов
+        self.model, self.vocab, self.unk_words = self._build_knrm_model()
+
+        # получаем id-text датасеты с train и dev
+        self.idx_to_text_mapping_train = self._get_idx_to_text_mapping(self.glue_train_df)
+        self.idx_to_text_mapping_dev = self._get_idx_to_text_mapping(self.glue_dev_df)
+
+        #
+        self.val_dataset = ValPairsDataset(self.dev_pairs_for_ndcg, self.idx_to_text_mapping_dev,
+                                           vocab = self.vocab,
+                                           oov_val = self.vocab['OOV'],
+                                           preproc_func = self._simple_preproc)
+
+
+
 
 
     # напишем функцию, которая читает трейн и text-файлы c лейблами
@@ -60,11 +89,11 @@ class Solution:
         inp_df_select = inp_df[['id_left','id_right','label']]
         # смотрим сколько вообще сэмплов в каждой id-группе
         inp_df_group_sizes = inp_df_select.groupby('id_left').size()
-        print("inp_df_group_sizes", inp_df_group_sizes)
+        #("inp_df_group_sizes", inp_df_group_sizes)
         # теперь выбираем конкретные айдишники текстов с левой колонки - id_left где записей больше 2
         # это нужно, чтобы сделать каждую группу хотя бы минимально представительной
         glue_dev_leftids_to_use = list(inp_df_group_sizes[inp_df_group_sizes >= min_group_size].index)
-        print("glue_dev_leftids_to_use", glue_dev_leftids_to_use)
+        #print("glue_dev_leftids_to_use", glue_dev_leftids_to_use)
         # теперь выбираем из изначального датасета только представительные номера, которые обозначили на предыдущем шаге
         groups = inp_df_select[inp_df_select.id_left.isin(glue_dev_leftids_to_use)].groupby('id_left')
         # получаем список всех ids (правый не фильтруем так как id - симметричные)
@@ -73,7 +102,7 @@ class Solution:
         np.random.seed(seed)
         out_pairs = []
         pad_sample = []
-        print('groups',groups)
+        #print('groups',groups)
         for id_left, group in groups:
             # для каждого id_left выбираем все пары релевантных документов
             ones_ids = group[group.label>0].id_right.values
@@ -182,7 +211,71 @@ class Solution:
         emb_matrix, vocab, unk_words = self._create_glove_emb_from_file(self.glove_vectors_path,
                                                                        self.all_tokens, self.random_seed,
                                                                        self.emb_rand_uni_bound)
-        return emb_matrix, vocab, unk_words
+        torch.manual_seed(self.random_seed)
+        knrm = KNRM(emb_matrix, freeze_embeddings = self.freeze_embeddings, kernel_num = self.knrm_kernel_num,
+                    out_layers = self.knrm_out_mlp)
+        return knrm, vocab, unk_words
+
+
+    # надо будет по индексам вынимать тексты
+    # создаем словарь чтобы по id могли легко вынимать тексты
+    # и тексты справа и тексты с айди слева все в одну строку
+    def _get_idx_to_text_mapping(self, inp_df):
+        left_dict = (inp_df[['id_left','text_left']].drop_duplicates().set_index('id_left')['text_left'].to_dict())
+        right_dict = (inp_df[['id_right','text_right']].drop_duplicates().set_index('id_right')['text_right'].to_dict())
+        left_dict.update(right_dict)
+        return left_dict
+
+
+
+
+# а этот класс для того чтобы трейн сделать
+class RankingDataset(torch.utils.data.Dataset):
+    def __init__(self, index_pairs_or_triplets, idx_to_text_mapping, vocab, oov_val, preproc_func, max_len=30):
+        self.index_pairs_or_triplets = index_pairs_or_triplets
+        self.vocab = vocab
+        # значение, если слова нет в словаре
+        self.oov_val = oov_val
+        self.preproc_func = preproc_func
+        self.idx_to_text_mapping = idx_to_text_mapping
+        # ограничиваем текст в запросе и документе
+        # это ухудшает смыл, но улучшает производительность
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.index_pairs_or_triplets)
+
+    def _tokenized_text_to_index(self, tokenized_text):
+        # берем значение по слову i
+        # если такого слова нет в словаре, то передаем значение self.oov_val - не в словаре
+        res = [self.vocab.get(i, self.oov_val) for i in tokenized_text]
+        return res
+
+    def _convert_text_idx_to_token_idxs(self, idx):
+        # берем запрос по кокнретному idx
+        # предобрабатываем его, токенизируем
+        # берем idx, используем функцию idx_to_text_mapping, чтобы поулчить текст
+        # далее сам текст предобрабатываем, убираем символы пунктуации и пр.
+        # внутри функции preproc_func есть разбитие на токены с помощью nltk
+        tokenized_text = self.preproc_func(self.idx_to_text_mapping[idx])
+        # далее надо понять какие индексы соотвесттвуют этим токенам в словаре
+        idxs = self._tokenized_text_to_index(tokenized_text)
+        return idxs
+
+# этот класс копирует трейн класс частично, но используется для создания пар(pair, target)
+class ValPairsDataset(RankingDataset):
+    def __getitem__(self,idx):
+        cur_row = self.index_pairs_or_triplets[idx]
+        print(cur_row)
+        left_idxs = self._convert_text_idx_to_token_idxs(cur_row[0])[:self.max_len]
+        r1_idxs = self._convert_text_idx_to_token_idxs(cur_row[1])[:self.max_len]
+
+        pair = {'query':left_idxs, 'document':r1_idxs}
+        target = cur_row[2]
+        print(pair, target)
+        return (pair, target)
+
+
 
 
 
@@ -277,17 +370,98 @@ sol = Solution(
 print("sol", sol)
 
 
-emb_matrix, vocab, unk_words = sol._build_knrm_model()
+knrm, vocab, unk_words = sol._build_knrm_model()
 
-print(f"Форма матрицы эмбеддингов: {emb_matrix.shape}")
+print(f"Модель KNRM форма: {knrm}")
 print(f"Размер словаря: {len(vocab)}")
 print(f"Количество неизвестных слов: {len(unk_words)}")
 if len(unk_words) > 0:
     print(f"Примеры неизвестных слов: {unk_words[:10]}")
 print(f"Пример словаря (первые 5 слов): {list(vocab.items())[:5]}")
-print(f"Тип данных матрицы: {emb_matrix.dtype}")
-print(f"Несколько значений из матрицы: {emb_matrix[0, :5]}")
 
 print("\n" + "="*50)
 print("ТЕСТИРОВАНИЕ ЗАВЕРШЕНО")
 print("="*50)
+
+# ============= НОВЫЙ КОД ДЛЯ ПРОВЕРКИ val_dataset =============
+print("\n" + "=" * 70)
+print("ПРОВЕРКА ValPairsDataset")
+print("=" * 70)
+
+# Проверяем, что val_dataset создался
+print(f"\nТип val_dataset: {type(sol.val_dataset)}")
+print(f"Размер val_dataset: {len(sol.val_dataset)}")
+
+# Выводим первые 5 элементов из dev_pairs_for_ndcg (сырые данные)
+print(f"\nПервые 5 пар из dev_pairs_for_ndcg:")
+for i, pair in enumerate(sol.dev_pairs_for_ndcg[:5]):
+    print(f"  {i + 1}. {pair}")
+
+# Проверяем работу __getitem__ для первых нескольких элементов
+print(f"\nПервые 5 элементов из val_dataset (после преобразования):")
+for i in range(min(5, len(sol.val_dataset))):
+    print(f"\n--- Элемент {i} ---")
+    pair, target = sol.val_dataset[i]
+    print(f"  Query (индексы): {pair['query']}")
+    print(f"  Document (индексы): {pair['document']}")
+    print(f"  Target: {target}")
+
+    # Декодируем обратно в текст для проверки (опционально)
+    # Создаем обратный словарь: индекс -> слово
+    idx_to_word = {idx: word for word, idx in sol.vocab.items()}
+
+    query_words = [idx_to_word.get(idx, '<UNK>') for idx in pair['query']]
+    doc_words = [idx_to_word.get(idx, '<UNK>') for idx in pair['document']]
+
+    print(f"  Query (слова): {query_words}")
+    print(f"  Document (слова): {doc_words}")
+
+ """
+ Первые 5 элементов из val_dataset (после преобразования):
+
+--- Элемент 0 ---
+['0', '0', 1]
+{'query': [21, 143, 11167, 197, 1468], 'document': [21, 143, 11167, 197, 1468]} 1
+  Query (индексы): [21, 143, 11167, 197, 1468]
+  Document (индексы): [21, 143, 11167, 197, 1468]
+  Target: 1
+  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
+  Document (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
+
+--- Элемент 1 ---
+['0', np.str_('29202'), 0]
+{'query': [21, 143, 11167, 197, 1468], 'document': [38, 15, 69, 615, 826, 17645, 8726, 124, 22218, 395]} 0
+  Query (индексы): [21, 143, 11167, 197, 1468]
+  Document (индексы): [38, 15, 69, 615, 826, 17645, 8726, 124, 22218, 395]
+  Target: 0
+  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
+  Document (слова): ['is', 'a', '100', 'rupees', 'demand', 'draft', 'issued', 'at', 'canara', 'bank']
+
+--- Элемент 2 ---
+['0', np.str_('32534'), 0]
+{'query': [21, 143, 11167, 197, 1468], 'document': [340, 143, 2840, 2434, 4984]} 0
+  Query (индексы): [21, 143, 11167, 197, 1468]
+  Document (индексы): [340, 143, 2840, 2434, 4984]
+  Target: 0
+  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
+  Document (слова): ['where', 'are', 'period', 'cramps', 'located']
+
+--- Элемент 3 ---
+['0', np.str_('35186'), 0]
+{'query': [21, 143, 11167, 197, 1468], 'document': [2, 13, 4, 2235, 1746, 196, 7, 1198, 47, 537, 155, 494, 15, 1240, 10216]} 0
+  Query (индексы): [21, 143, 11167, 197, 1468]
+  Document (индексы): [2, 13, 4, 2235, 1746, 196, 7, 1198, 47, 537, 155, 494, 15, 1240, 10216]
+  Target: 0
+  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
+  Document (слова): ['how', 'can', 'i', 'transfer', 'files', 'from', 'my', 'phone', 'to', 'pc', 'without', 'using', 'a', 'usb', 'cable']
+
+--- Элемент 4 ---
+['0', np.str_('28879'), 0]
+{'query': [21, 143, 11167, 197, 1468], 'document': [2, 3, 4, 7463, 7, 259, 111]} 0
+  Query (индексы): [21, 143, 11167, 197, 1468]
+  Document (индексы): [2, 3, 4, 7463, 7, 259, 111]
+  Target: 0
+  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
+  Document (слова): ['how', 'do', 'i', 'strengthen', 'my', 'will', 'power']
+ 
+ """

@@ -15,12 +15,12 @@ class KNRM(torch.nn.Module):
         Использует ядра гаусса для моделирования совпадений на разных уровнях точности
     """
     def __init__(self,
-                 emb_path,
-                 mlp_path,
+                 embedding_matrix,
+                 freeze_embeddings,
                  kernel_num=21,
                  sigma=0.1,
                  exact_sigma=0.001,
-                 out_layers=[]):
+                 out_layers=[10,5]):
         """
             Args:
             kernel_num: количество ядер (по умолчанию 21, как в оригинальной статье)
@@ -28,18 +28,18 @@ class KNRM(torch.nn.Module):
         """
         super(KNRM, self).__init__()
         self.embeddings = torch.nn.Embedding.from_pretrained(
-            torch.load(emb_path)['weight'],
-            freeze=True,
+            torch.FloatTensor(embedding_matrix),
+            freeze=freeze_embeddings,
             padding_idx=0
         )
-        self.kernel_num = kernel_num
         self.sigma = sigma
-        self.exact_sigma = exact_sigma
         self.out_layers = out_layers
+        self.kernel_num = kernel_num
+        self.exact_sigma = exact_sigma
         self.kernels = self._get_kernels_layers()
         self.mlp = self._get_mlp()
         # передаем в MLP веса на слои - инициализируем их
-        self.mlp.load_state_dict(torch.load(mlp_path))
+        #self.mlp.load_state_dict(torch.load(mlp_path))
         self.out_activation = torch.nn.Sigmoid()
 
 
@@ -179,29 +179,29 @@ class KNRM(torch.nn.Module):
 # # Сохраняем тестовый MLP
 # torch.save(mlp_state_dict, 'test_mlp.pt')
 
-model = KNRM(
-    emb_path='glove_embeddings.pt',
-    mlp_path='test_mlp.pt',
-    kernel_num=21,
-    sigma=0.1,
-    exact_sigma=0.001,
-    out_layers=[128, 64]
-)
-
-model.eval()
-
-batch_size = 4
-query_len = 5
-doc_len = 10
-vocab_size = 1000
-
-query = torch.randint(1, vocab_size, size=(batch_size, query_len))
-doc = torch.randint(1, vocab_size, size=(batch_size, doc_len))
-
-with torch.no_grad():
-    inputs = {
-        'query': query,
-        'document': doc
-    }
-    output = model(inputs)
-    print(output)
+# model = KNRM(
+#     emb_path='glove_embeddings.pt',
+#     mlp_path='test_mlp.pt',
+#     kernel_num=21,
+#     sigma=0.1,
+#     exact_sigma=0.001,
+#     out_layers=[128, 64]
+# )
+#
+# model.eval()
+#
+# batch_size = 4
+# query_len = 5
+# doc_len = 10
+# vocab_size = 1000
+#
+# query = torch.randint(1, vocab_size, size=(batch_size, query_len))
+# doc = torch.randint(1, vocab_size, size=(batch_size, doc_len))
+#
+# with torch.no_grad():
+#     inputs = {
+#         'query': query,
+#         'document': doc
+#     }
+#     output = model(inputs)
+#     print(output)
