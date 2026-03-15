@@ -59,13 +59,16 @@ class Solution:
         self.idx_to_text_mapping_train = self._get_idx_to_text_mapping(self.glue_train_df)
         self.idx_to_text_mapping_dev = self._get_idx_to_text_mapping(self.glue_dev_df)
 
-        #
+        # создаем датасет из пар (запрос, документ) и соотоветствующая им оценка релевантности
         self.val_dataset = ValPairsDataset(self.dev_pairs_for_ndcg, self.idx_to_text_mapping_dev,
                                            vocab = self.vocab,
                                            oov_val = self.vocab['OOV'],
                                            preproc_func = self._simple_preproc)
-
-
+        # теперь из валидационного датасета надо сделать даталоадер
+        # одновременно с этим запрос и документ надо дополнить до требуемого размера или обрезать
+        # за это ответчает функция collate_fn
+        self.val_dataloader = torch.utils.data.DataLoader(self.val_dataset, batch_size=self.dataloader_bs,\
+                                                          num_workers=0, collate_fn = collate_fn, shuffle=False)
 
 
 
@@ -277,8 +280,68 @@ class ValPairsDataset(RankingDataset):
 
 
 
+# эта функция отвечает за корректный размер батча для запроса и документа, чтобы было ровно
+def collate_fn(batch_obj):
+    max_len_q1 = -1
+    max_len_d1 = -1
+    max_len_q2 = -1
+    max_len_d2 = -1
+    is_triplets = False
 
+    for elem in batch_obj:
+        if len(elem)==3:
+            left_elem, right_elem, label = elem
+            is_triplets = True
+        # если Pointwise - подход (+ на этапе инференса его можно использовать)
+        else:
+            left_elem, label = elem
 
+        max_len_q1 = max(len(left_elem['query']), max_len_q1)
+        max_len_d1 = max(len(left_elem['document']), max_len_d1)
+        if len(elem)==3:
+            max_len_q2 = max(len(right_elem['query']), max_len_q2)
+            max_len_d2 = max(len(right_elem['document']), max_len_d2)
+    q1s = []
+    q2s = []
+    d1s = []
+    d2s = []
+    labels = []
+
+    for elem in batch_obj:
+        if is_triplets:
+            left_elem, right_elem,label = elem
+            is_triplets = True
+        else:
+            left_elem, label = elem
+
+        # считаем сколько надо добавить к каждой последовательности
+        pad_len1 = max_len_q1 - len(left_elem['query'])
+        pad_len2 = max_len_d1 - len(left_elem['document'])
+        if is_triplets:
+            pad_len3 = max_len_d2 - len(right_elem['document'])
+            pad_len4 = max_len_q2 - len(right_elem['query'])
+
+        q1s.append(left_elem['query']+[0]*pad_len1)
+        d1s.append(left_elem['document']+[0]*pad_len2)
+        if is_triplets:
+            q2s.append(right_elem['query']+[0]*pad_len3)
+            d2s.append(right_elem['document']+[0]*pad_len4)
+        labels.append(label)
+
+    # переводим в тензора
+    q1s = torch.LongTensor(q1s)
+    d1s = torch.LongTensor(d1s)
+    if is_triplets:
+        q2s = torch.LongTensor(q2s)
+        d2s = torch.LongTensor(d2s)
+    labels = torch.LongTensor(labels)
+
+    res_left = {'query':q1s, 'document':d1s}
+    if is_triplets:
+        res_right = {'query':q2s, 'document':d2s}
+        return res_left, res_right, labels
+    else:
+        return res_left, labels
 
 
 
@@ -416,52 +479,114 @@ for i in range(min(5, len(sol.val_dataset))):
     print(f"  Query (слова): {query_words}")
     print(f"  Document (слова): {doc_words}")
 
- """
- Первые 5 элементов из val_dataset (после преобразования):
+# ============= ПРОВЕРКА collate_fn =============
+print("\n" + "=" * 70)
+print("ПРОВЕРКА collate_fn")
+print("=" * 70)
 
---- Элемент 0 ---
-['0', '0', 1]
-{'query': [21, 143, 11167, 197, 1468], 'document': [21, 143, 11167, 197, 1468]} 1
-  Query (индексы): [21, 143, 11167, 197, 1468]
-  Document (индексы): [21, 143, 11167, 197, 1468]
-  Target: 1
-  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
-  Document (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
+# Берем первые 2 элемента из val_dataset вручную
+print("\n1. Сначала проверим отдельные элементы val_dataset:")
+sample_elements = []
+for i in range(2):
+    pair, target = sol.val_dataset[i]
+    sample_elements.append((pair, target))
+    print(f"\nЭлемент {i}:")
+    print(f"  Query (длина {len(pair['query'])}): {pair['query']}")
+    print(f"  Document (длина {len(pair['document'])}): {pair['document']}")
+    print(f"  Target: {target}")
 
---- Элемент 1 ---
-['0', np.str_('29202'), 0]
-{'query': [21, 143, 11167, 197, 1468], 'document': [38, 15, 69, 615, 826, 17645, 8726, 124, 22218, 395]} 0
-  Query (индексы): [21, 143, 11167, 197, 1468]
-  Document (индексы): [38, 15, 69, 615, 826, 17645, 8726, 124, 22218, 395]
-  Target: 0
-  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
-  Document (слова): ['is', 'a', '100', 'rupees', 'demand', 'draft', 'issued', 'at', 'canara', 'bank']
+# Теперь применяем collate_fn к этим двум элементам
+print("\n" + "-" * 50)
+print("2. Применяем collate_fn к батчу из 2 элементов:")
+batch = sample_elements  # это список из (pair, target)
+result = collate_fn(batch)
 
---- Элемент 2 ---
-['0', np.str_('32534'), 0]
-{'query': [21, 143, 11167, 197, 1468], 'document': [340, 143, 2840, 2434, 4984]} 0
-  Query (индексы): [21, 143, 11167, 197, 1468]
-  Document (индексы): [340, 143, 2840, 2434, 4984]
-  Target: 0
-  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
-  Document (слова): ['where', 'are', 'period', 'cramps', 'located']
+print(f"\nТип результата: {type(result)}")
+print(f"Длина результата: {len(result)}")
 
---- Элемент 3 ---
-['0', np.str_('35186'), 0]
-{'query': [21, 143, 11167, 197, 1468], 'document': [2, 13, 4, 2235, 1746, 196, 7, 1198, 47, 537, 155, 494, 15, 1240, 10216]} 0
-  Query (индексы): [21, 143, 11167, 197, 1468]
-  Document (индексы): [2, 13, 4, 2235, 1746, 196, 7, 1198, 47, 537, 155, 494, 15, 1240, 10216]
-  Target: 0
-  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
-  Document (слова): ['how', 'can', 'i', 'transfer', 'files', 'from', 'my', 'phone', 'to', 'pc', 'without', 'using', 'a', 'usb', 'cable']
+# Распаковываем результат
+if len(result) == 2:  # pointwise режим
+    left_batch, labels_batch = result
+    print("\nРежим: POINTWISE")
+    print(f"\nleft_batch keys: {left_batch.keys()}")
+    print(f"query tensor shape: {left_batch['query'].shape}")
+    print(f"document tensor shape: {left_batch['document'].shape}")
+    print(f"labels tensor shape: {labels_batch.shape}")
 
---- Элемент 4 ---
-['0', np.str_('28879'), 0]
-{'query': [21, 143, 11167, 197, 1468], 'document': [2, 3, 4, 7463, 7, 259, 111]} 0
-  Query (индексы): [21, 143, 11167, 197, 1468]
-  Document (индексы): [2, 3, 4, 7463, 7, 259, 111]
-  Target: 0
-  Query (слова): ['why', 'are', 'hispanics', 'so', 'beautiful']
-  Document (слова): ['how', 'do', 'i', 'strengthen', 'my', 'will', 'power']
- 
- """
+    print(f"\nquery tensor (первые 2 строки):\n{left_batch['query'][:2]}")
+    print(f"\ndocument tensor (первые 2 строки):\n{left_batch['document'][:2]}")
+    print(f"\nlabels tensor: {labels_batch}")
+
+else:  # triplet режим (хотя у нас val_dataset с 2 элементами)
+    left_batch, right_batch, labels_batch = result
+    print("\nРежим: TRIPLET")
+    print(f"left_batch keys: {left_batch.keys()}")
+    print(f"right_batch keys: {right_batch.keys()}")
+    print(f"left query shape: {left_batch['query'].shape}")
+    print(f"left document shape: {left_batch['document'].shape}")
+    print(f"right query shape: {right_batch['query'].shape}")
+    print(f"right document shape: {right_batch['document'].shape}")
+    print(f"labels shape: {labels_batch.shape}")
+
+# Проверяем, что все последовательности выровнены до одной длины
+print("\n" + "-" * 50)
+print("3. Проверка выравнивания (padding):")
+
+if len(result) == 2:
+    # Для pointwise: проверяем длины query и document
+    query_lens = [len(sample_elements[i][0]['query']) for i in range(2)]
+    doc_lens = [len(sample_elements[i][0]['document']) for i in range(2)]
+
+    print(f"Исходные длины query: {query_lens}")
+    print(f"Исходные длины document: {doc_lens}")
+    print(f"После padding - query shape: {left_batch['query'].shape}")
+    print(f"После padding - document shape: {left_batch['document'].shape}")
+
+    # Проверяем, что паддинг нулями работает
+    max_query_len = max(query_lens)
+    max_doc_len = max(doc_lens)
+
+    print(f"\nПроверка первой строки query (должна быть длина {max_query_len}):")
+    print(f"  Было: {sample_elements[0][0]['query']}")
+    print(f"  Стало: {left_batch['query'][0].tolist()}")
+    print(f"  Добавлено паддингов: {left_batch['query'][0].tolist()[query_lens[0]:]}")
+
+    print(f"\nПроверка второй строки query (должна быть длина {max_query_len}):")
+    print(f"  Было: {sample_elements[1][0]['query']}")
+    print(f"  Стало: {left_batch['query'][1].tolist()}")
+    print(f"  Добавлено паддингов: {left_batch['query'][1].tolist()[query_lens[1]:]}")
+
+# Проверяем через dataloader
+print("\n" + "-" * 50)
+print("4. Проверка через val_dataloader (первые 2 батча):")
+
+# Берем первые 2 батча из dataloader
+for batch_idx, batch_data in enumerate(sol.val_dataloader):
+    if batch_idx >= 2:  # только первые 2 батча
+        break
+
+    print(f"\n--- Батч {batch_idx + 1} ---")
+
+    if len(batch_data) == 2:
+        left_batch, labels_batch = batch_data
+        print(f"Тип: POINTWISE")
+        print(f"Query shape: {left_batch['query'].shape}")
+        print(f"Document shape: {left_batch['document'].shape}")
+        print(f"Labels shape: {labels_batch.shape}")
+        print(f"Labels: {labels_batch}")
+
+        # Проверяем первые 2 элемента в батче
+        print(f"\nПервые 2 query в батче (первые 10 токенов):")
+        for i in range(min(2, left_batch['query'].shape[0])):
+            print(f"  Query {i}: {left_batch['query'][i][:10].tolist()}...")
+            print(f"  Doc {i}: {left_batch['document'][i][:10].tolist()}...")
+    else:
+        left_batch, right_batch, labels_batch = batch_data
+        print(f"Тип: TRIPLET")
+        print(f"Left query shape: {left_batch['query'].shape}")
+        print(f"Right query shape: {right_batch['query'].shape}")
+        print(f"Labels shape: {labels_batch.shape}")
+
+print("\n" + "=" * 70)
+print("ПРОВЕРКА ЗАВЕРШЕНА")
+print("=" * 70)
