@@ -265,6 +265,58 @@ class RankingDataset(torch.utils.data.Dataset):
         idxs = self._tokenized_text_to_index(tokenized_text)
         return idxs
 
+
+    def train(self, n_epochs):
+        opt = torch.optim.SGD(self.model.parameters(), lr = self.train_lr)
+        criterion = torch.nn.BCELoss()
+        # массив для метрик ndcg
+        ndcgs = []
+        for ep in range(n_epochs):
+            print("ep", ep)
+            # надо перезагружать наш тренировочный набор данных, чтобы мы не обучались все время на одном
+            if ep%self.change_train_loader_ep == 0:
+                # подгружаем в следующую эпоху новые сэмплы с тренировочного датасета
+                sampled_train_triplets = self._sample_data_for_train_iter(self.glue_train_df, seed = ep)
+                print(sampled_train_triplets)
+
+    def _sample_data_for_train_iter(self, inp_df, seed):
+        inp_df['label'] = inp_df['label'].astype('int64')
+        groups = inp_df[['id_left','id_right','label']].groupby('id_left')
+        pairs_w_labels = []
+        np.random.seed(seed)
+        all_rights_ids = inp_df.id_right.values
+        for id_left, group in groups:
+            # нам надо выбрать пары сначала, где для одного левого id есть как минимум два правых
+            # обучать надо как на негативном так и на позитивном примерах для одного запроса
+            labels = group.label.unique()
+            if len(labels)>1:
+                for label in labels:
+                    # выбираем все одинаковые лейблы - нули или единицы
+                    same_label_samples = group[group.label==label]['id_right'].values
+
+                    # если же мы нашли отрицательный пример в плане дублей но документы одинаковы
+                    # для этог запроса, то надо, чтобы их количество было больше 1, потому что
+                    # потом каждому проставим 0.5 релевантность и они будут в обучении конкурировать междуу собой
+                    if label==0 and len(same_label_samples)>1:
+                        sample = np.random.choice(same_label_samples, 2, replace=False)
+                        pairs_w_labels.append([id_left, sample[0], sample[1], 0.5])
+                    elif label==1:
+                        # надо выбрать один вопрос с лейблом 1, а второй точно нет, чтобы один быыл выше второго
+                        less_label_samples = group[group.label<label].id_right.values
+                        pos_sample = np.random.choice(same_label_samples, 1, replace=False)
+                        if len(less_label_samples)>0:
+                            neg_sample = np.random.choice(less_label_samples, 1, replace=False)
+                        else:
+                            neg_sample = np.random.choice(all_rights_ids, 1, replace=False)
+
+                        pairs_w_labels.append([id_left, pos_sample[0], neg_sample[0], 1])
+        return pairs_w_labels
+
+
+
+
+
+
 # этот класс копирует трейн класс частично, но используется для создания пар(pair, target)
 class ValPairsDataset(RankingDataset):
     def __getitem__(self,idx):
