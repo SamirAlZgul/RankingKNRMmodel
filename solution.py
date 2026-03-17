@@ -231,41 +231,6 @@ class Solution:
 
 
 
-
-# а этот класс для того чтобы трейн сделать
-class RankingDataset(torch.utils.data.Dataset):
-    def __init__(self, index_pairs_or_triplets, idx_to_text_mapping, vocab, oov_val, preproc_func, max_len=30):
-        self.index_pairs_or_triplets = index_pairs_or_triplets
-        self.vocab = vocab
-        # значение, если слова нет в словаре
-        self.oov_val = oov_val
-        self.preproc_func = preproc_func
-        self.idx_to_text_mapping = idx_to_text_mapping
-        # ограничиваем текст в запросе и документе
-        # это ухудшает смыл, но улучшает производительность
-        self.max_len = max_len
-
-    def __len__(self):
-        return len(self.index_pairs_or_triplets)
-
-    def _tokenized_text_to_index(self, tokenized_text):
-        # берем значение по слову i
-        # если такого слова нет в словаре, то передаем значение self.oov_val - не в словаре
-        res = [self.vocab.get(i, self.oov_val) for i in tokenized_text]
-        return res
-
-    def _convert_text_idx_to_token_idxs(self, idx):
-        # берем запрос по кокнретному idx
-        # предобрабатываем его, токенизируем
-        # берем idx, используем функцию idx_to_text_mapping, чтобы поулчить текст
-        # далее сам текст предобрабатываем, убираем символы пунктуации и пр.
-        # внутри функции preproc_func есть разбитие на токены с помощью nltk
-        tokenized_text = self.preproc_func(self.idx_to_text_mapping[idx])
-        # далее надо понять какие индексы соотвесттвуют этим токенам в словаре
-        idxs = self._tokenized_text_to_index(tokenized_text)
-        return idxs
-
-
     def train(self, n_epochs):
         opt = torch.optim.SGD(self.model.parameters(), lr = self.train_lr)
         criterion = torch.nn.BCELoss()
@@ -278,6 +243,11 @@ class RankingDataset(torch.utils.data.Dataset):
                 # подгружаем в следующую эпоху новые сэмплы с тренировочного датасета
                 sampled_train_triplets = self._sample_data_for_train_iter(self.glue_train_df, seed = ep)
                 print(sampled_train_triplets)
+                train_dataset = TrainTripletsDataset(sampled_train_triplets, self.idx_to_text_mapping_train,
+                                                     vocab = self.vocab, oov_val = self.vocab['OOV'],
+                                                     preproc_func = self._simple_preproc)
+
+
 
     def _sample_data_for_train_iter(self, inp_df, seed):
         inp_df['label'] = inp_df['label'].astype('int64')
@@ -313,6 +283,60 @@ class RankingDataset(torch.utils.data.Dataset):
         return pairs_w_labels
 
 
+
+
+
+
+# а этот класс для того чтобы трейн сделать
+class RankingDataset(torch.utils.data.Dataset):
+    def __init__(self, index_pairs_or_triplets, idx_to_text_mapping, vocab, oov_val, preproc_func, max_len=30):
+        self.index_pairs_or_triplets = index_pairs_or_triplets
+        self.vocab = vocab
+        # значение, если слова нет в словаре
+        self.oov_val = oov_val
+        self.preproc_func = preproc_func
+        self.idx_to_text_mapping = idx_to_text_mapping
+        # ограничиваем текст в запросе и документе
+        # это ухудшает смыл, но улучшает производительность
+        self.max_len = max_len
+
+    def __len__(self):
+        return len(self.index_pairs_or_triplets)
+
+    def _tokenized_text_to_index(self, tokenized_text):
+        # берем значение по слову i
+        # если такого слова нет в словаре, то передаем значение self.oov_val - не в словаре
+        res = [self.vocab.get(i, self.oov_val) for i in tokenized_text]
+        return res
+
+    def _convert_text_idx_to_token_idxs(self, idx):
+        # берем запрос по кокнретному idx
+        # предобрабатываем его, токенизируем
+        # берем idx, используем функцию idx_to_text_mapping, чтобы поулчить текст
+        # далее сам текст предобрабатываем, убираем символы пунктуации и пр.
+        # внутри функции preproc_func есть разбитие на токены с помощью nltk
+        tokenized_text = self.preproc_func(self.idx_to_text_mapping[idx])
+        # далее надо понять какие индексы соотвесттвуют этим токенам в словаре
+        idxs = self._tokenized_text_to_index(tokenized_text)
+        return idxs
+    def __getitem__(self, idx):
+        pass
+
+
+
+class TrainTripletsDataset(RankingDataset):
+    def __getitem__(self, idx):
+        # достаем по индексу текст
+        cur_row = self.index_pairs_or_triplets[idx]
+        # из текста вычленяем токены
+        left_idxs = self._convert_text_idx_to_token_idxs(cur_row[0])[:self.max_len]
+        r1_idxs = self._convert_text_idx_to_token_idxs(cur_row[1])[:self.max_len]
+        r2_idxs = self._convert_text_idx_to_token_idxs(cur_row[2])[:self.max_len]
+
+        pair_1 = {'query':left_idxs, 'document':r1_idxs}
+        pair_2 = {'query':left_idxs, 'document':r2_idxs}
+        target = cur_row[3]
+        return (pair_1, pair_2, target)
 
 
 
