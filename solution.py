@@ -246,6 +246,39 @@ class Solution:
                 train_dataset = TrainTripletsDataset(sampled_train_triplets, self.idx_to_text_mapping_train,
                                                      vocab = self.vocab, oov_val = self.vocab['OOV'],
                                                      preproc_func = self._simple_preproc)
+                # теперь формируем даталоадер, чтобы обучать батчами
+                train_dataloader = torch.utils.data.DataLoader(\
+                    train_dataset, batch_size = self.dataloader_bs, num_workers=0, collate_fn=collate_fn,\
+                    shuffle=True,)
+
+            for batch in train_dataloader:
+                inp_1, inp_2, y = batch
+                preds = self.model(inp_1, inp_2)
+                loss = criterion(preds,y)
+                loss.backward()
+                opt.step()
+            ndcg = self.valid(self.model, self.val_dataloader)
+
+
+    def valid(self, model, val_dataloader):
+        labels_and_groups = val_dataloader.dataset.index_pairs_or_triplets
+        labels_and_groups = pd.DataFrame(labels_and_groups, columns=['id_left', 'id_right', 'rel'])
+
+        all_preds = []
+        for batch in val_dataloader:
+            inp_1,y = batch
+            preds = model._predict(inp_1)
+            preds_np = preds.detach().numpy()
+            all_preds.append(preds_np)
+        all_preds = np.concatenate(all_preds, axis=0)
+        labels_and_groups['preds'] = all_preds
+
+        ndcgs = []
+        for cur_id in labels_and_groups.left_id.unique():
+            cur_df = labels_and_groups[labels_and_groups.left_id==cur_id]
+            ndcg = self._ndcg_k()
+
+
 
 
 
