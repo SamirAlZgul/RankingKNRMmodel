@@ -5,6 +5,7 @@
 import pandas as pd
 import numpy as np
 import torch
+import math
 from pandas import read_csv
 
 import string
@@ -276,9 +277,25 @@ class Solution:
         ndcgs = []
         for cur_id in labels_and_groups.left_id.unique():
             cur_df = labels_and_groups[labels_and_groups.left_id==cur_id]
-            ndcg = self._ndcg_k()
+            ndcg = self._ndcg_k(cur_df.rel.values.reshape(-1), cur_df.preds.values.reshape(-1))
+            if np.isnan(ndcg):
+                ndcgs.append(0)
+            else:
+                ndcgs.append(ndcg)
+        return np.mean(ndcgs)
 
-
+    def _ndcg_k(self, ys_true, ys_pred, ndcg_top_k=10):
+        def dcg(ys_true, ys_pred):
+            argsort = np.argsort(ys_pred)[::-1]
+            argsort = argsort[:ndcg_top_k]
+            ys_true_sorted = ys_true[argsort]
+            ret = 0
+            for i,l in enumerate(ys_true_sorted,1):
+                ret+=(2**l-1)/(math.log2(i+1))
+            return ret
+        ideal_dcg = dcg(ys_true, ys_true)
+        pred_dcg = dcg(ys_true, ys_pred)
+        return (pred_dcg/ideal_dcg)
 
 
 
