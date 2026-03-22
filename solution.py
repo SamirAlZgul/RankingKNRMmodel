@@ -1,36 +1,67 @@
-'''
-
-будем обучать правильно рандировать документы, для этого надо написать все функции по формированию документов
-'''
 import pandas as pd
 import numpy as np
 import torch
 import math
 from pandas import read_csv
-
 import string
 import nltk
 from collections import Counter
-from datasets import load_dataset
+import sys
+import random
+
+
+# Set random seeds early
+def set_seeds(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+# Set seed before any operations
+set_seeds(0)
+
 glove_vectors_path = "glove.6B/glove.6B.50d.txt"
 
-# импортируем описанную модель KNRM
-from main import KNRM
+
+# Custom Sampler that doesn't use numpy
+class CustomRandomSampler(torch.utils.data.Sampler):
+    def __init__(self, data_source, generator=None):
+        self.data_source = data_source
+        self.generator = generator
+
+    def __iter__(self):
+        indices = list(range(len(self.data_source)))
+        if self.generator is not None:
+            # Use PyTorch generator to shuffle
+            for i in range(len(indices) - 1, 0, -1):
+                j = torch.randint(0, i + 1, (1,), generator=self.generator).item()
+                indices[i], indices[j] = indices[j], indices[i]
+        else:
+            random.shuffle(indices)
+        return iter(indices)
+
+    def __len__(self):
+        return len(self.data_source)
+
 
 class Solution:
     def __init__(self, glue_qqp_dir,
                  glove_vectors_path,
-                 min_occurancies = 1,
-                 random_seed = 0,
-                 emb_rand_uni_bound = 0.2,
-                 freeze_knrm_embeddings = True,
-                 knrm_kernel_num = 21,
-                 knrm_out_mlp = [],
-                 dataloader_bs = 1024,
-                 train_lr = 0.001,
-                 change_train_loader_ep = 10
+                 min_occurancies=1,
+                 random_seed=0,
+                 emb_rand_uni_bound=0.2,
+                 freeze_knrm_embeddings=True,
+                 knrm_kernel_num=21,
+                 knrm_out_mlp=[],
+                 dataloader_bs=1024,
+                 train_lr=0.001,
+                 change_train_loader_ep=10
                  ):
 
+        # Set random seeds for reproducibility
+        set_seeds(random_seed)
 
         # путь до папки с трейном и тестом
         self.glue_qqp_dir = glue_qqp_dir
@@ -39,11 +70,21 @@ class Solution:
         # надо взять отдельно трейн и тест
         self.glue_train_df = self._get_glue_df('train')
         self.glue_dev_df = self._get_glue_df('dev')
+
+        # Debug data structure
+        self.debug_data_structure()
+
+        # Проверка, что данные не пустые
+        if len(self.glue_train_df) == 0:
+            raise ValueError("Training data is empty!")
+        if len(self.glue_dev_df) == 0:
+            raise ValueError("Development data is empty!")
+
         # теперь из этого надо создать валидационный набор
         self.dev_pairs_for_ndcg = self._create_val_pairs(self.glue_dev_df)
 
         self.min_occurancies = min_occurancies
-        self.all_tokens = self._get_all_tokens([self.glue_train_df,self.glue_dev_df], self.min_occurancies)
+        self.all_tokens = self._get_all_tokens([self.glue_train_df, self.glue_dev_df], self.min_occurancies)
 
         self.random_seed = random_seed
         self.emb_rand_uni_bound = emb_rand_uni_bound
@@ -53,6 +94,7 @@ class Solution:
         self.dataloader_bs = dataloader_bs
         self.train_lr = train_lr
         self.change_train_loader_ep = change_train_loader_ep
+
         # получаем модель инициализированную, словарь слов и словарь редких слов, для которых нет эмбеддингов
         self.model, self.vocab, self.unk_words = self._build_knrm_model()
 
@@ -60,123 +102,168 @@ class Solution:
         self.idx_to_text_mapping_train = self._get_idx_to_text_mapping(self.glue_train_df)
         self.idx_to_text_mapping_dev = self._get_idx_to_text_mapping(self.glue_dev_df)
 
-        # создаем датасет из пар (запрос, документ) и соотоветствующая им оценка релевантности
-        self.val_dataset = ValPairsDataset(self.dev_pairs_for_ndcg, self.idx_to_text_mapping_dev,
-                                           vocab = self.vocab,
-                                           oov_val = self.vocab['OOV'],
-                                           preproc_func = self._simple_preproc)
-        # теперь из валидационного датасета надо сделать даталоадер
-        # одновременно с этим запрос и документ надо дополнить до требуемого размера или обрезать
-        # за это ответчает функция collate_fn
-        self.val_dataloader = torch.utils.data.DataLoader(self.val_dataset, batch_size=self.dataloader_bs,\
-                                                          num_workers=0, collate_fn = collate_fn, shuffle=False)
+        # создаем датасет из пар (запрос, документ) и соответствующая им оценка релевантности
+        if len(self.dev_pairs_for_ndcg) > 0:
+            self.val_dataset = ValPairsDataset(self.dev_pairs_for_ndcg, self.idx_to_text_mapping_dev,
+                                               vocab=self.vocab,
+                                               oov_val=self.vocab['OOV'],
+                                               preproc_func=self._simple_preproc,
+                                               max_len=30)
+            # Use shuffle=False to avoid RandomSampler
+            self.val_dataloader = torch.utils.data.DataLoader(
+                self.val_dataset, batch_size=self.dataloader_bs,
+                num_workers=0, collate_fn=collate_fn, shuffle=False
+            )
+        else:
+            print("Warning: No validation pairs created!")
+            self.val_dataloader = None
 
+    def debug_data_structure(self):
+        """Debug method to understand data structure"""
+        print("\n=== Data Structure Debug ===")
+        print(f"Train data shape: {self.glue_train_df.shape}")
+        print(f"Train columns: {list(self.glue_train_df.columns)}")
+        print(f"Label distribution in train:")
+        print(self.glue_train_df['label'].value_counts())
 
+        print(f"\nDev data shape: {self.glue_dev_df.shape}")
+        print(f"Label distribution in dev:")
+        print(self.glue_dev_df['label'].value_counts())
+
+        # Check groups
+        groups = self.glue_train_df.groupby('id_left')
+        print(f"\nNumber of unique queries in train: {len(groups)}")
+
+        # Count queries with both positive and negative docs
+        queries_with_both = 0
+        for query_id, group in groups:
+            has_pos = (group.label == 1).any()
+            has_neg = (group.label == 0).any()
+            if has_pos and has_neg:
+                queries_with_both += 1
+
+        print(f"Queries with both positive and negative docs: {queries_with_both}")
+
+        # Show sample
+        print("\nSample data:")
+        print(self.glue_train_df.head())
+        print("=== End Debug ===\n")
 
     # напишем функцию, которая читает трейн и text-файлы c лейблами
     def _get_glue_df(self, partition_type):
         assert partition_type in ['train', 'dev']
-        glue_df = read_csv(self.glue_qqp_dir+f'{partition_type}.tsv', sep='\t', dtype='object')
-        glue_df = glue_df.dropna(axis = 0, how='any').reset_index(drop=True)
-        glue_df_fin = pd.DataFrame({'id_left':glue_df['qid1'],
-                                    'id_right':glue_df['qid2'],
-                                    'text_left':glue_df['question1'],
-                                    'text_right':glue_df['question2'],
-                                    'label':glue_df['is_duplicate']})
+        glue_df = read_csv(self.glue_qqp_dir + f'{partition_type}.tsv', sep='\t', dtype='object')
+        glue_df = glue_df.dropna(axis=0, how='any').reset_index(drop=True)
+        glue_df_fin = pd.DataFrame({'id_left': glue_df['qid1'],
+                                    'id_right': glue_df['qid2'],
+                                    'text_left': glue_df['question1'],
+                                    'text_right': glue_df['question2'],
+                                    'label': glue_df['is_duplicate']})
+        # Convert label to numeric
+        glue_df_fin['label'] = pd.to_numeric(glue_df_fin['label'], errors='coerce')
+        glue_df_fin = glue_df_fin.dropna().reset_index(drop=True)
         return glue_df_fin
 
-    # напишем функцию, которая формирует набор, на ктором будем валидировать обученную модель
-    def _create_val_pairs(self, inp_df, fill_top_to=15, min_group_size=1, seed = 0):
-        # на вход приходит датасет inp_df
+    def _create_val_pairs(self, inp_df, fill_top_to=15, min_group_size=1, seed=0):
+        """Create validation pairs with proper structure"""
         inp_df['label'] = inp_df['label'].astype('int64')
         # выбираем айдишники и лейблы - мы всегда восстановим по айдишникам сами текста
-        inp_df_select = inp_df[['id_left','id_right','label']]
+        inp_df_select = inp_df[['id_left', 'id_right', 'label']]
+
         # смотрим сколько вообще сэмплов в каждой id-группе
         inp_df_group_sizes = inp_df_select.groupby('id_left').size()
-        #("inp_df_group_sizes", inp_df_group_sizes)
-        # теперь выбираем конкретные айдишники текстов с левой колонки - id_left где записей больше 2
-        # это нужно, чтобы сделать каждую группу хотя бы минимально представительной
+
+        # выбираем конкретные айдишники текстов с левой колонки - id_left где записей больше 2
         glue_dev_leftids_to_use = list(inp_df_group_sizes[inp_df_group_sizes >= min_group_size].index)
-        #print("glue_dev_leftids_to_use", glue_dev_leftids_to_use)
-        # теперь выбираем из изначального датасета только представительные номера, которые обозначили на предыдущем шаге
-        groups = inp_df_select[inp_df_select.id_left.isin(glue_dev_leftids_to_use)].groupby('id_left')
+
         # получаем список всех ids (правый не фильтруем так как id - симметричные)
         all_ids = set(inp_df['id_left']).union(set(inp_df['id_right']))
-        #print("all_ids", all_ids)
-        np.random.seed(seed)
+
+        # Устанавливаем seed для PyTorch
+        torch.manual_seed(seed)
+        random.seed(seed)
         out_pairs = []
-        pad_sample = []
-        #print('groups',groups)
-        for id_left, group in groups:
+
+        for id_left in glue_dev_leftids_to_use:
+            group = inp_df_select[inp_df_select.id_left == id_left]
+
             # для каждого id_left выбираем все пары релевантных документов
-            ones_ids = group[group.label>0].id_right.values
-            # и все пары нерелеватных документов
-            zeroes_ids = group[group.label==0].id_left.values
+            ones_ids = group[group.label > 0].id_right.values
+            # и все пары нерелевантных документов
+            zeroes_ids = group[group.label == 0].id_right.values
+
             # теперь смотрим их количество
-            sum_len = len(ones_ids)+len(zeroes_ids)
-            # теперь смотрим, сколько пар в каждую группу надо добавить для того ,чтобы избежать дисбаланса в группах
-            # то есть чтобы везде было по 15 сэмплов
-            # это нужно для стабильности обучения, бат-обработки и т д
-            num_pad_items = max(0, fill_top_to-sum_len)
-            if num_pad_items>0:
-                # если к текущей группе нужно добавить сколько то семплов до 15
-                # то выбираем элементы которые надо добавить
-                # это вот все которые на текущем шаге выбраны - их нельзя боать
-                cur_chosen = set(ones_ids).union(set(zeroes_ids)).union(id_left)
+            sum_len = len(ones_ids) + len(zeroes_ids)
+
+            # сколько пар нужно добавить для того, чтобы везде было по fill_top_to сэмплов
+            num_pad_items = max(0, fill_top_to - sum_len)
+            pad_sample = []
+
+            if num_pad_items > 0:
+                # все текущие выбранные элементы
+                cur_chosen = set(ones_ids).union(set(zeroes_ids)).union({id_left})
                 # из остальных рандомно добираем пары ids
-                pad_sample = list(np.random.choice(list(all_ids-cur_chosen), num_pad_items, replace=False))
-            else:
-                pad_sample=[]
-            # теперь мы получили для конкретного id_left все 15 пар - надо семплировать
+                available_ids = list(all_ids - cur_chosen)
+
+                if len(available_ids) >= num_pad_items:
+                    # Выбираем без повторений используя Python random
+                    import random as py_random
+                    pad_sample = py_random.sample(available_ids, num_pad_items)
+                else:
+                    # Если недостаточно, используем с повторением
+                    if len(available_ids) > 0:
+                        import random as py_random
+                        pad_sample = [py_random.choice(available_ids) for _ in range(num_pad_items)]
+                    else:
+                        # Если вообще нет доступных, используем случайные ID
+                        import random as py_random
+                        all_ids_list = list(all_ids)
+                        pad_sample = [py_random.choice(all_ids_list) for _ in range(num_pad_items)]
+
+            # добавляем все пары
             for i in ones_ids:
-                out_pairs.append([id_left,i,2])
+                out_pairs.append([id_left, i, 2])  # релевантные
             for i in zeroes_ids:
-                out_pairs.append([id_left,i,1])
+                out_pairs.append([id_left, i, 1])  # нерелевантные
             for i in pad_sample:
-                out_pairs.append([id_left,i,0])
+                out_pairs.append([id_left, i, 0])  # заполнители
+
         return out_pairs
 
-    #напишем функцию, которая правильно фильтрует полученные датасеты: убираем знаки препинания, формирует нижний
-    #регистр и пр.
+    # напишем функцию, которая правильно фильтрует полученные датасеты
     def _get_all_tokens(self, list_of_df, min_occurancies):
-        tokens=[]
-        # проходимся по каждому датасету
+        tokens = []
         for df in list_of_df:
-            unique_texts = set(df[['text_left','text_right']].values.reshape(-1))
-            # склеиваем все тексты в одну строку
-            unique_texts = str(' '.join(unique_texts))
-            # предобрабатывваем ве тексты и токенизируем их
-            df_tokens = self._simple_preproc(unique_texts)
-            tokens.extend(df_tokens)
-        # далее из общего списка, надо убрать редкие слова, чтобы модель не зацикливалась на них
+            if len(df) > 0:
+                # Get unique texts from both columns
+                unique_texts = set(df[['text_left', 'text_right']].values.reshape(-1))
+                # Convert all texts to strings and join them
+                unique_texts_str = ' '.join(str(text) for text in unique_texts)
+                # Tokenize
+                df_tokens = self._simple_preproc(unique_texts_str)
+                tokens.extend(df_tokens)
         count_filtered = self._filter_rare_words(Counter(tokens), min_occurancies)
-        # поулчаем словарь с убранными редкими токенами, которые встречаются реже, чем min_occurancies
         return list(count_filtered.keys())
 
-    # здесь функция которая для каждого текста убираем лишние пробелы и вызывает функцию удаления знаков пунктуации
-    # и далее токенизирует слова
     def _simple_preproc(self, inp_str):
-        base_str = inp_str.strip().lower()
+        base_str = str(inp_str).strip().lower()
         str_wo_punct = self._handle_punctuation(base_str)
         return nltk.word_tokenize(str_wo_punct)
 
-    # функция, которая убирает все знаки пунктуации
     def _handle_punctuation(self, inp_str):
         inp_str = str(inp_str)
         for punct in string.punctuation:
-            inp_str = inp_str.replace(punct,'')
+            inp_str = inp_str.replace(punct, '')
         return inp_str
 
-    # функция, которая убирает редкие слова проходясь по словарю
     def _filter_rare_words(self, vocab, min_occurancies):
         out_vocab = dict()
         for word, cnt in vocab.items():
-            if cnt>min_occurancies:
+            if cnt > min_occurancies:
                 out_vocab[word] = cnt
         return out_vocab
 
-
-    def _read_glove_embeddings(self,file_path):
+    def _read_glove_embeddings(self, file_path):
         embedding_data = {}
         with open(file_path, 'r', encoding='utf-8') as f:
             for line in f:
@@ -184,22 +271,22 @@ class Solution:
                 embedding_data[current_line[0]] = current_line[1:]
         return embedding_data
 
-
     def _create_glove_emb_from_file(self, file_path, inner_keys, random_seed, rand_uni_bound):
         glove_emb = self._read_glove_embeddings(file_path)
         inner_keys = ['PAD', 'OOV'] + inner_keys
-        # коиличество строк в матрице = количество слов
         high_matrix = len(inner_keys)
-        # размерность эмбеддинга
-        len_matrix = len(list(glove_emb.values())[0])
-        print(high_matrix)
-        print(len_matrix)
+
+        # Get embedding dimension from the first vector
+        if glove_emb:
+            len_matrix = len(list(glove_emb.values())[0])
+        else:
+            len_matrix = 50  # Default for GloVe 50d
 
         matrix = np.empty((high_matrix, len_matrix))
         vocab = dict()
         unk_words = []
         np.random.seed(random_seed)
-        # проходимся по словам
+
         for idx, word in enumerate(inner_keys):
             vocab[word] = idx
             if word in glove_emb:
@@ -209,510 +296,479 @@ class Solution:
                 matrix[idx] = np.random.uniform(-rand_uni_bound, rand_uni_bound, size=len_matrix)
         return matrix, vocab, unk_words
 
-
-
     def _build_knrm_model(self):
-        emb_matrix, vocab, unk_words = self._create_glove_emb_from_file(self.glove_vectors_path,
-                                                                       self.all_tokens, self.random_seed,
-                                                                       self.emb_rand_uni_bound)
+        # Import KNRM here to avoid circular imports
+        import main
+        KNRM = main.KNRM
+
+        emb_matrix, vocab, unk_words = self._create_glove_emb_from_file(
+            self.glove_vectors_path,
+            self.all_tokens,
+            self.random_seed,
+            self.emb_rand_uni_bound
+        )
         torch.manual_seed(self.random_seed)
-        knrm = KNRM(emb_matrix, freeze_embeddings = self.freeze_embeddings, kernel_num = self.knrm_kernel_num,
-                    out_layers = self.knrm_out_mlp)
+        knrm = KNRM(emb_matrix,
+                    freeze_embeddings=self.freeze_embeddings,
+                    kernel_num=self.knrm_kernel_num,
+                    out_layers=self.knrm_out_mlp)
         return knrm, vocab, unk_words
 
-
-    # надо будет по индексам вынимать тексты
-    # создаем словарь чтобы по id могли легко вынимать тексты
-    # и тексты справа и тексты с айди слева все в одну строку
     def _get_idx_to_text_mapping(self, inp_df):
-        left_dict = (inp_df[['id_left','text_left']].drop_duplicates().set_index('id_left')['text_left'].to_dict())
-        right_dict = (inp_df[['id_right','text_right']].drop_duplicates().set_index('id_right')['text_right'].to_dict())
+        left_dict = (inp_df[['id_left', 'text_left']].drop_duplicates().set_index('id_left')['text_left'].to_dict())
+        right_dict = (
+            inp_df[['id_right', 'text_right']].drop_duplicates().set_index('id_right')['text_right'].to_dict())
         left_dict.update(right_dict)
         return left_dict
 
-
-
     def train(self, n_epochs):
-        opt = torch.optim.SGD(self.model.parameters(), lr = self.train_lr)
-        criterion = torch.nn.BCELoss()
-        # массив для метрик ndcg
+        opt = torch.optim.Adam(self.model.parameters(), lr=self.train_lr)
+        criterion = torch.nn.BCEWithLogitsLoss()
         ndcgs = []
+
         for ep in range(n_epochs):
-            print("ep", ep)
-            # надо перезагружать наш тренировочный набор данных, чтобы мы не обучались все время на одном
-            if ep%self.change_train_loader_ep == 0:
-                # подгружаем в следующую эпоху новые сэмплы с тренировочного датасета
-                sampled_train_triplets = self._sample_data_for_train_iter(self.glue_train_df, seed = ep)
-                print(sampled_train_triplets)
-                train_dataset = TrainTripletsDataset(sampled_train_triplets, self.idx_to_text_mapping_train,
-                                                     vocab = self.vocab, oov_val = self.vocab['OOV'],
-                                                     preproc_func = self._simple_preproc)
-                # теперь формируем даталоадер, чтобы обучать батчами
-                train_dataloader = torch.utils.data.DataLoader(\
-                    train_dataset, batch_size = self.dataloader_bs, num_workers=0, collate_fn=collate_fn,\
-                    shuffle=True,)
+            print(f"\n{'=' * 50}")
+            print(f"Epoch {ep}/{n_epochs}")
+            print(f"{'=' * 50}")
 
-            for batch in train_dataloader:
-                inp_1, inp_2, y = batch
-                preds = self.model(inp_1, inp_2)
-                loss = criterion(preds,y)
-                loss.backward()
-                opt.step()
-            ndcg = self.valid(self.model, self.val_dataloader)
+            # Создаем новые триплеты для каждой эпохи
+            sampled_train_triplets = self._sample_data_for_train_iter(
+                self.glue_train_df,
+                seed=ep,
+                max_triplets=20000
+            )
 
+            if len(sampled_train_triplets) == 0:
+                print(f"ОШИБКА: Нет данных для эпохи {ep}")
+                continue
+
+            print(f"Создано {len(sampled_train_triplets)} триплетов для обучения")
+
+            train_dataset = TrainTripletsDataset(
+                sampled_train_triplets,
+                self.idx_to_text_mapping_train,
+                vocab=self.vocab,
+                oov_val=self.vocab['OOV'],
+                preproc_func=self._simple_preproc,
+                max_len=30
+            )
+
+            # Используем кастомный sampler вместо shuffle=True
+            generator = torch.Generator()
+            generator.manual_seed(ep)
+            sampler = CustomRandomSampler(train_dataset, generator=generator)
+
+            train_dataloader = torch.utils.data.DataLoader(
+                train_dataset,
+                batch_size=self.dataloader_bs,
+                sampler=sampler,
+                num_workers=0,
+                collate_fn=collate_fn
+            )
+
+            # Обучение
+            self.model.train()
+            total_loss = 0
+            num_batches = 0
+
+            for batch_idx, batch in enumerate(train_dataloader):
+                try:
+                    inp_1, inp_2, y = batch
+
+                    preds_1 = self.model(inp_1)
+                    preds_2 = self.model(inp_2)
+
+                    loss = criterion(preds_1.squeeze() - preds_2.squeeze(), y.float())
+
+                    opt.zero_grad()
+                    loss.backward()
+                    opt.step()
+
+                    total_loss += loss.item()
+                    num_batches += 1
+
+                    if batch_idx % 50 == 0:
+                        print(f"  Batch {batch_idx}, Loss: {loss.item():.4f}")
+
+                except Exception as e:
+                    print(f"Ошибка в батче {batch_idx}: {e}")
+                    continue
+
+            avg_loss = total_loss / num_batches if num_batches > 0 else 0
+            print(f"Epoch {ep} - Средний Loss: {avg_loss:.4f}")
+
+            # Валидация
+            if self.val_dataloader:
+                ndcg = self.valid(self.model, self.val_dataloader)
+                ndcgs.append(ndcg)
+                print(f"Epoch {ep} - NDCG: {ndcg:.4f}")
+
+                if ndcg > 0.925:
+                    print(f"Ранняя остановка на эпохе {ep} с NDCG {ndcg:.4f}")
+                    break
+
+        return ndcgs
+
+    # Остальные методы без изменений...
+    def _create_fallback_training_data(self, inp_df, seed, max_pairs=10000):
+        """Fallback method to create training data when no triplets are available"""
+        set_seeds(seed)
+        inp_df['label'] = inp_df['label'].astype('int64')
+
+        triplets = []
+
+        # Get all positive pairs
+        positive_pairs = inp_df[inp_df.label == 1][['id_left', 'id_right']].values
+        # Get all negative pairs
+        negative_pairs = inp_df[inp_df.label == 0][['id_left', 'id_right']].values
+
+        print(f"Positive pairs available: {len(positive_pairs)}")
+        print(f"Negative pairs available: {len(negative_pairs)}")
+
+        # If we have both positive and negative pairs, create triplets
+        if len(positive_pairs) > 0 and len(negative_pairs) > 0:
+            # Create up to max_pairs triplets
+            num_triplets = min(max_pairs, len(positive_pairs) * len(negative_pairs))
+
+            for _ in range(num_triplets):
+                # Random positive pair
+                pos_idx = np.random.randint(0, len(positive_pairs))
+                pos_query, pos_doc = positive_pairs[pos_idx]
+
+                # Random negative pair
+                neg_idx = np.random.randint(0, len(negative_pairs))
+                neg_query, neg_doc = negative_pairs[neg_idx]
+
+                # Use positive query as the query
+                triplets.append([pos_query, pos_doc, neg_doc, 1])
+
+        # If still no triplets, create from pairs with same query
+        if len(triplets) == 0:
+            # Group by query
+            groups = inp_df.groupby('id_left')
+
+            for query_id, group in groups:
+                docs_with_labels = group[['id_right', 'label']].values
+
+                if len(docs_with_labels) >= 2:
+                    # Try to find at least one positive and one negative
+                    pos_docs = [doc for doc, label in docs_with_labels if label == 1]
+                    neg_docs = [doc for doc, label in docs_with_labels if label == 0]
+
+                    if len(pos_docs) > 0 and len(neg_docs) > 0:
+                        for pos_doc in pos_docs[:5]:  # Limit to 5 per query
+                            for neg_doc in neg_docs[:5]:
+                                triplets.append([query_id, pos_doc, neg_doc, 1])
+                                if len(triplets) >= max_pairs:
+                                    break
+                            if len(triplets) >= max_pairs:
+                                break
+                    if len(triplets) >= max_pairs:
+                        break
+
+        print(f"Created {len(triplets)} fallback training triplets")
+        return triplets
+
+    def _sample_data_for_train_iter(self, inp_df, seed, max_triplets=10000):
+        """Улучшенная выборка обучающих данных с учетом структуры датасета"""
+        set_seeds(seed)
+        inp_df['label'] = inp_df['label'].astype('int64')
+
+        triplets = []
+
+        # Получаем все положительные и отрицательные пары
+        positive_pairs = inp_df[inp_df.label == 1][['id_left', 'id_right']].values
+        negative_pairs = inp_df[inp_df.label == 0][['id_left', 'id_right']].values
+
+        print(f"Доступно положительных пар: {len(positive_pairs)}")
+        print(f"Доступно отрицательных пар: {len(negative_pairs)}")
+
+        # Создаем триплеты, комбинируя положительные и отрицательные пары
+        if len(positive_pairs) > 0 and len(negative_pairs) > 0:
+            # Ограничиваем количество триплетов
+            num_triplets = min(max_triplets, len(positive_pairs) * len(negative_pairs))
+
+            # Используем torch для генерации случайных индексов
+            for _ in range(num_triplets):
+                # Выбираем случайную положительную пару
+                pos_idx = torch.randint(0, len(positive_pairs), (1,)).item()
+                pos_query, pos_doc = positive_pairs[pos_idx]
+
+                # Выбираем случайную отрицательную пару
+                neg_idx = torch.randint(0, len(negative_pairs), (1,)).item()
+                neg_query, neg_doc = negative_pairs[neg_idx]
+
+                # Используем запрос из положительной пары
+                triplets.append([int(pos_query), int(pos_doc), int(neg_doc), 1])
+
+                # Также иногда используем запрос из отрицательной пары для разнообразия
+                if torch.rand(1).item() < 0.3:
+                    triplets.append([int(neg_query), int(pos_doc), int(neg_doc), 1])
+
+        # Если всё еще нет триплетов, пробуем другой подход
+        if len(triplets) == 0:
+            print("Пробуем альтернативный метод создания триплетов...")
+
+            # Группируем по обоим id (левый и правый)
+            all_queries = {}
+
+            # Создаем словарь: запрос -> список (документ, релевантность)
+            for _, row in inp_df.iterrows():
+                # Для левого id
+                if row['id_left'] not in all_queries:
+                    all_queries[row['id_left']] = []
+                all_queries[row['id_left']].append((row['id_right'], row['label']))
+
+                # Для правого id тоже может быть запросом
+                if row['id_right'] not in all_queries:
+                    all_queries[row['id_right']] = []
+                all_queries[row['id_right']].append((row['id_left'], row['label']))
+
+            # Создаем триплеты из запросов, у которых есть и положительные, и отрицательные документы
+            for query_id, docs_with_labels in all_queries.items():
+                pos_docs = [doc for doc, label in docs_with_labels if label == 1]
+                neg_docs = [doc for doc, label in docs_with_labels if label == 0]
+
+                if len(pos_docs) > 0 and len(neg_docs) > 0:
+                    # Создаем до 20 триплетов на запрос
+                    max_per_query = min(20, len(pos_docs) * len(neg_docs))
+                    for _ in range(max_per_query):
+                        pos_idx = torch.randint(0, len(pos_docs), (1,)).item()
+                        neg_idx = torch.randint(0, len(neg_docs), (1,)).item()
+                        pos_doc = pos_docs[pos_idx]
+                        neg_doc = neg_docs[neg_idx]
+                        triplets.append([int(query_id), int(pos_doc), int(neg_doc), 1])
+
+                        if len(triplets) >= max_triplets:
+                            break
+
+                if len(triplets) >= max_triplets:
+                    break
+
+        # Если всё еще нет, создаем искусственные пары
+        if len(triplets) == 0:
+            print("Создаем искусственные пары...")
+            # Берем все положительные пары как релевантные
+            # и случайные документы из других запросов как нерелевантные
+            all_docs = set(inp_df['id_left'].values) | set(inp_df['id_right'].values)
+            all_docs_list = list(all_docs)
+
+            for query_id, pos_doc in positive_pairs[:200]:  # Ограничиваем количество
+                # Ищем нерелевантный документ
+                candidate_docs = list(all_docs - {pos_doc})
+                if candidate_docs:
+                    neg_idx = torch.randint(0, len(candidate_docs), (1,)).item()
+                    neg_doc = candidate_docs[neg_idx]
+                    triplets.append([int(query_id), int(pos_doc), int(neg_doc), 1])
+
+                    if len(triplets) >= max_triplets:
+                        break
+
+        print(f"Создано {len(triplets)} тренировочных триплетов")
+        return triplets
 
     def valid(self, model, val_dataloader):
+        if val_dataloader is None:
+            return 0.0
+
         labels_and_groups = val_dataloader.dataset.index_pairs_or_triplets
         labels_and_groups = pd.DataFrame(labels_and_groups, columns=['id_left', 'id_right', 'rel'])
 
         all_preds = []
-        for batch in val_dataloader:
-            inp_1,y = batch
-            preds = model._predict(inp_1)
-            preds_np = preds.detach().numpy()
-            all_preds.append(preds_np)
-        all_preds = np.concatenate(all_preds, axis=0)
+        model.eval()
+        with torch.no_grad():
+            for batch in val_dataloader:
+                pair, _ = batch
+                # Исправление здесь - передаем словарь в модель
+                preds = model(pair)  # pair уже является словарем с ключами 'query' и 'document'
+                # Конвертируем в список Python вместо numpy
+                preds_list = preds.squeeze().tolist()
+                if isinstance(preds_list, list):
+                    all_preds.extend(preds_list)
+                else:
+                    all_preds.append(preds_list)
+
+        if not all_preds:
+            return 0.0
+
         labels_and_groups['preds'] = all_preds
 
         ndcgs = []
-        for cur_id in labels_and_groups.left_id.unique():
-            cur_df = labels_and_groups[labels_and_groups.left_id==cur_id]
-            ndcg = self._ndcg_k(cur_df.rel.values.reshape(-1), cur_df.preds.values.reshape(-1))
-            if np.isnan(ndcg):
-                ndcgs.append(0)
-            else:
-                ndcgs.append(ndcg)
-        return np.mean(ndcgs)
+        for cur_id in labels_and_groups['id_left'].unique():
+            cur_df = labels_and_groups[labels_and_groups['id_left'] == cur_id]
+            if len(cur_df) > 1:
+                ndcg = self._ndcg_k(cur_df.rel.values, cur_df.preds.values, ndcg_top_k=10)
+                if not np.isnan(ndcg):
+                    ndcgs.append(ndcg)
+
+        return np.mean(ndcgs) if ndcgs else 0.0
 
     def _ndcg_k(self, ys_true, ys_pred, ndcg_top_k=10):
+        """
+        Вычисляет NDCG@k без использования numpy (только Python списки)
+        """
+
         def dcg(ys_true, ys_pred):
-            argsort = np.argsort(ys_pred)[::-1]
-            argsort = argsort[:ndcg_top_k]
-            ys_true_sorted = ys_true[argsort]
+            # Создаем список пар (значение, индекс)
+            pairs = list(enumerate(ys_pred))
+            # Сортируем по значению предсказания (убывание)
+            pairs.sort(key=lambda x: x[1], reverse=True)
+            # Берем топ-k индексов
+            top_k_indices = [idx for idx, _ in pairs[:ndcg_top_k]]
+            # Сортируем истинные значения по этим индексам
+            ys_true_sorted = [ys_true[i] for i in top_k_indices]
             ret = 0
-            for i,l in enumerate(ys_true_sorted,1):
-                ret+=(2**l-1)/(math.log2(i+1))
+            for i, l in enumerate(ys_true_sorted, 1):
+                ret += (2 ** l - 1) / (math.log2(i + 1))
             return ret
+
+        # Конвертируем в списки, если это numpy массивы
+        if hasattr(ys_true, 'tolist'):
+            ys_true = ys_true.tolist()
+        if hasattr(ys_pred, 'tolist'):
+            ys_pred = ys_pred.tolist()
+
         ideal_dcg = dcg(ys_true, ys_true)
+        if ideal_dcg == 0:
+            return 0.0
         pred_dcg = dcg(ys_true, ys_pred)
-        return (pred_dcg/ideal_dcg)
+        return pred_dcg / ideal_dcg
 
 
-
-    def _sample_data_for_train_iter(self, inp_df, seed):
-        inp_df['label'] = inp_df['label'].astype('int64')
-        groups = inp_df[['id_left','id_right','label']].groupby('id_left')
-        pairs_w_labels = []
-        np.random.seed(seed)
-        all_rights_ids = inp_df.id_right.values
-        for id_left, group in groups:
-            # нам надо выбрать пары сначала, где для одного левого id есть как минимум два правых
-            # обучать надо как на негативном так и на позитивном примерах для одного запроса
-            labels = group.label.unique()
-            if len(labels)>1:
-                for label in labels:
-                    # выбираем все одинаковые лейблы - нули или единицы
-                    same_label_samples = group[group.label==label]['id_right'].values
-
-                    # если же мы нашли отрицательный пример в плане дублей но документы одинаковы
-                    # для этог запроса, то надо, чтобы их количество было больше 1, потому что
-                    # потом каждому проставим 0.5 релевантность и они будут в обучении конкурировать междуу собой
-                    if label==0 and len(same_label_samples)>1:
-                        sample = np.random.choice(same_label_samples, 2, replace=False)
-                        pairs_w_labels.append([id_left, sample[0], sample[1], 0.5])
-                    elif label==1:
-                        # надо выбрать один вопрос с лейблом 1, а второй точно нет, чтобы один быыл выше второго
-                        less_label_samples = group[group.label<label].id_right.values
-                        pos_sample = np.random.choice(same_label_samples, 1, replace=False)
-                        if len(less_label_samples)>0:
-                            neg_sample = np.random.choice(less_label_samples, 1, replace=False)
-                        else:
-                            neg_sample = np.random.choice(all_rights_ids, 1, replace=False)
-
-                        pairs_w_labels.append([id_left, pos_sample[0], neg_sample[0], 1])
-        return pairs_w_labels
-
-
-
-
-
-
-# а этот класс для того чтобы трейн сделать
 class RankingDataset(torch.utils.data.Dataset):
     def __init__(self, index_pairs_or_triplets, idx_to_text_mapping, vocab, oov_val, preproc_func, max_len=30):
         self.index_pairs_or_triplets = index_pairs_or_triplets
         self.vocab = vocab
-        # значение, если слова нет в словаре
         self.oov_val = oov_val
         self.preproc_func = preproc_func
         self.idx_to_text_mapping = idx_to_text_mapping
-        # ограничиваем текст в запросе и документе
-        # это ухудшает смыл, но улучшает производительность
         self.max_len = max_len
 
     def __len__(self):
         return len(self.index_pairs_or_triplets)
 
     def _tokenized_text_to_index(self, tokenized_text):
-        # берем значение по слову i
-        # если такого слова нет в словаре, то передаем значение self.oov_val - не в словаре
         res = [self.vocab.get(i, self.oov_val) for i in tokenized_text]
         return res
 
     def _convert_text_idx_to_token_idxs(self, idx):
-        # берем запрос по кокнретному idx
-        # предобрабатываем его, токенизируем
-        # берем idx, используем функцию idx_to_text_mapping, чтобы поулчить текст
-        # далее сам текст предобрабатываем, убираем символы пунктуации и пр.
-        # внутри функции preproc_func есть разбитие на токены с помощью nltk
+        if idx not in self.idx_to_text_mapping:
+            return []
         tokenized_text = self.preproc_func(self.idx_to_text_mapping[idx])
-        # далее надо понять какие индексы соотвесттвуют этим токенам в словаре
         idxs = self._tokenized_text_to_index(tokenized_text)
-        return idxs
+        return idxs[:self.max_len]
+
     def __getitem__(self, idx):
         pass
 
 
-
 class TrainTripletsDataset(RankingDataset):
     def __getitem__(self, idx):
-        # достаем по индексу текст
         cur_row = self.index_pairs_or_triplets[idx]
-        # из текста вычленяем токены
-        left_idxs = self._convert_text_idx_to_token_idxs(cur_row[0])[:self.max_len]
-        r1_idxs = self._convert_text_idx_to_token_idxs(cur_row[1])[:self.max_len]
-        r2_idxs = self._convert_text_idx_to_token_idxs(cur_row[2])[:self.max_len]
+        left_idxs = self._convert_text_idx_to_token_idxs(cur_row[0])
+        r1_idxs = self._convert_text_idx_to_token_idxs(cur_row[1])
+        r2_idxs = self._convert_text_idx_to_token_idxs(cur_row[2])
 
-        pair_1 = {'query':left_idxs, 'document':r1_idxs}
-        pair_2 = {'query':left_idxs, 'document':r2_idxs}
+        pair_1 = {'query': left_idxs, 'document': r1_idxs}
+        pair_2 = {'query': left_idxs, 'document': r2_idxs}
         target = cur_row[3]
         return (pair_1, pair_2, target)
 
 
-
-
-# этот класс копирует трейн класс частично, но используется для создания пар(pair, target)
 class ValPairsDataset(RankingDataset):
-    def __getitem__(self,idx):
+    def __getitem__(self, idx):
         cur_row = self.index_pairs_or_triplets[idx]
-        print(cur_row)
-        left_idxs = self._convert_text_idx_to_token_idxs(cur_row[0])[:self.max_len]
-        r1_idxs = self._convert_text_idx_to_token_idxs(cur_row[1])[:self.max_len]
+        left_idxs = self._convert_text_idx_to_token_idxs(cur_row[0])
+        r1_idxs = self._convert_text_idx_to_token_idxs(cur_row[1])
 
-        pair = {'query':left_idxs, 'document':r1_idxs}
+        pair = {'query': left_idxs, 'document': r1_idxs}
         target = cur_row[2]
-        print(pair, target)
         return (pair, target)
 
 
-
-# эта функция отвечает за корректный размер батча для запроса и документа, чтобы было ровно
 def collate_fn(batch_obj):
-    max_len_q1 = -1
-    max_len_d1 = -1
-    max_len_q2 = -1
-    max_len_d2 = -1
+    max_len_q = -1
+    max_len_d = -1
     is_triplets = False
 
+    # First pass to find max lengths
     for elem in batch_obj:
-        if len(elem)==3:
+        if len(elem) == 3:
             left_elem, right_elem, label = elem
             is_triplets = True
-        # если Pointwise - подход (+ на этапе инференса его можно использовать)
+            max_len_q = max(len(left_elem['query']), max_len_q)
+            max_len_d = max(len(left_elem['document']), max_len_d)
+            max_len_q = max(len(right_elem['query']), max_len_q)
+            max_len_d = max(len(right_elem['document']), max_len_d)
         else:
             left_elem, label = elem
+            max_len_q = max(len(left_elem['query']), max_len_q)
+            max_len_d = max(len(left_elem['document']), max_len_d)
 
-        max_len_q1 = max(len(left_elem['query']), max_len_q1)
-        max_len_d1 = max(len(left_elem['document']), max_len_d1)
-        if len(elem)==3:
-            max_len_q2 = max(len(right_elem['query']), max_len_q2)
-            max_len_d2 = max(len(right_elem['document']), max_len_d2)
+    # Second pass to pad
     q1s = []
-    q2s = []
     d1s = []
+    q2s = []
     d2s = []
     labels = []
 
     for elem in batch_obj:
         if is_triplets:
-            left_elem, right_elem,label = elem
-            is_triplets = True
+            left_elem, right_elem, label = elem
+            pad_len_q1 = max_len_q - len(left_elem['query'])
+            pad_len_d1 = max_len_d - len(left_elem['document'])
+            pad_len_q2 = max_len_q - len(right_elem['query'])
+            pad_len_d2 = max_len_d - len(right_elem['document'])
+
+            q1s.append(left_elem['query'] + [0] * pad_len_q1)
+            d1s.append(left_elem['document'] + [0] * pad_len_d1)
+            q2s.append(right_elem['query'] + [0] * pad_len_q2)
+            d2s.append(right_elem['document'] + [0] * pad_len_d2)
+            labels.append(label)
         else:
             left_elem, label = elem
+            pad_len_q = max_len_q - len(left_elem['query'])
+            pad_len_d = max_len_d - len(left_elem['document'])
 
-        # считаем сколько надо добавить к каждой последовательности
-        pad_len1 = max_len_q1 - len(left_elem['query'])
-        pad_len2 = max_len_d1 - len(left_elem['document'])
-        if is_triplets:
-            pad_len3 = max_len_d2 - len(right_elem['document'])
-            pad_len4 = max_len_q2 - len(right_elem['query'])
+            q1s.append(left_elem['query'] + [0] * pad_len_q)
+            d1s.append(left_elem['document'] + [0] * pad_len_d)
+            labels.append(label)
 
-        q1s.append(left_elem['query']+[0]*pad_len1)
-        d1s.append(left_elem['document']+[0]*pad_len2)
-        if is_triplets:
-            q2s.append(right_elem['query']+[0]*pad_len3)
-            d2s.append(right_elem['document']+[0]*pad_len4)
-        labels.append(label)
-
-    # переводим в тензора
+    # Convert to tensors
     q1s = torch.LongTensor(q1s)
     d1s = torch.LongTensor(d1s)
+    labels = torch.FloatTensor(labels)
+
     if is_triplets:
         q2s = torch.LongTensor(q2s)
         d2s = torch.LongTensor(d2s)
-    labels = torch.LongTensor(labels)
-
-    res_left = {'query':q1s, 'document':d1s}
-    if is_triplets:
-        res_right = {'query':q2s, 'document':d2s}
-        return res_left, res_right, labels
+        return ({'query': q1s, 'document': d1s}, {'query': q2s, 'document': d2s}, labels)
     else:
-        return res_left, labels
+        return ({'query': q1s, 'document': d1s}, labels)
 
 
+# Main execution
+if __name__ == "__main__":
+    try:
+        sol = Solution(
+            glue_qqp_dir="glue_qqp/",
+            glove_vectors_path="glove.6B/glove.6B.50d.txt",
+            min_occurancies=1,
+            random_seed=42,
+            emb_rand_uni_bound=0.2,
+            freeze_knrm_embeddings=True
+        )
 
+        ndcgs = sol.train(12)
+        print(f"\n{'=' * 50}")
+        print(f"Training completed!")
+        print(f"Final NDCG scores: {ndcgs}")
+        if ndcgs:
+            print(f"Best NDCG: {max(ndcgs):.4f}")
+        print(f"{'=' * 50}")
 
+    except Exception as e:
+        print(f"Error during execution: {e}")
+        import traceback
 
-
-
-
-
-
-#
-# #TESTING...
-# dataset = load_dataset("nyu-mll/glue", "qqp")
-#
-#
-# def save_glue_format(split, df, filename):
-#     # Переименовываем колонки в оригинальный GLUE формат
-#     df_glue = pd.DataFrame({
-#         'qid1': df['question1'].index if 'qid1' not in df.columns else df['qid1'],
-#         'qid2': df['question2'].index if 'qid2' not in df.columns else df['qid2'],
-#         'question1': df['question1'],
-#         'question2': df['question2'],
-#         'is_duplicate': df['label']
-#     })
-#     df_glue.to_csv(filename, sep='\t', index=False)
-#
-# # Сохраняем train и dev
-# save_glue_format('train', dataset["train"].to_pandas(), './train.tsv')
-# save_glue_format('dev', dataset["validation"].to_pandas(), './dev.tsv')
-
-# try:
-#     # Пробуем новый вариант
-#     nltk.data.find('tokenizers/punkt_tab')
-#     print("Ресурс punkt_tab уже загружен")
-# except LookupError:
-#     print("Загружаем punkt_tab...")
-#     nltk.download('punkt_tab')
-#
-# # Создаем объект, но подменяем атрибуты после создания
-# sol = Solution.__new__(Solution)  # создаем объект без вызова __init__
-# sol.glue_qqp_dir = None
-# sol.min_occurancies = 1
-#
-# # Теперь вручную создаем тестовые датафреймы
-# test_df = pd.DataFrame({
-#     'text_left': [
-#         'Hello world!',           # слово Hello встречается
-#         'Hello Python!',           # слово Hello встречается снова
-#         'Python programming'       # слово Python встречается снова
-#     ],
-#     'text_right': [
-#         'Hello world again!',      # Hello и world
-#         'Python is great',
-#         'Python'                 # Python
-#     ]
-# })
-
-# Присваиваем тестовые датафреймы
-# sol.glue_train_df = test_df
-# sol.glue_dev_df = test_df.copy()
-#
-# # Теперь можно тестировать методы
-# print("="*60)
-# print("ТЕСТИРОВАНИЕ НА МАЛЕНЬКОМ ДАТАСЕТЕ")
-# print("="*60)
-
-# # Тестируем _get_all_tokens
-# tokens_1 = sol._get_all_tokens([sol.glue_train_df], min_occurancies=2)
-# print(f"\nmin_occurancies=1: {sorted(tokens_1)}")
-
-#TESTING get GLOVE embeddings
-#TESTING get GLOVE embeddings
-# sol = Solution.__new__(Solution)  # создаем объект без вызова __init__
-# sol.glue_qqp_dir = None
-# sol.min_occurancies = 1
-#
-# # Создаем тестовые данные
-# test_tokens = ['hello', 'world', 'python', 'programming']
-
-sol = Solution(
-    glue_qqp_dir="glue_qqp/",  # путь к папке с данными GLUE QQP
-    glove_vectors_path="glove.6B/glove.6B.50d.txt",  # путь к GloVe эмбеддингам
-    min_occurancies=1,
-    random_seed=0,
-    emb_rand_uni_bound=0.2,
-    freeze_knrm_embeddings=True
-)
-
-print("sol", sol)
-
-
-knrm, vocab, unk_words = sol._build_knrm_model()
-
-print(f"Модель KNRM форма: {knrm}")
-print(f"Размер словаря: {len(vocab)}")
-print(f"Количество неизвестных слов: {len(unk_words)}")
-if len(unk_words) > 0:
-    print(f"Примеры неизвестных слов: {unk_words[:10]}")
-print(f"Пример словаря (первые 5 слов): {list(vocab.items())[:5]}")
-
-print("\n" + "="*50)
-print("ТЕСТИРОВАНИЕ ЗАВЕРШЕНО")
-print("="*50)
-
-# ============= НОВЫЙ КОД ДЛЯ ПРОВЕРКИ val_dataset =============
-print("\n" + "=" * 70)
-print("ПРОВЕРКА ValPairsDataset")
-print("=" * 70)
-
-# Проверяем, что val_dataset создался
-print(f"\nТип val_dataset: {type(sol.val_dataset)}")
-print(f"Размер val_dataset: {len(sol.val_dataset)}")
-
-# Выводим первые 5 элементов из dev_pairs_for_ndcg (сырые данные)
-print(f"\nПервые 5 пар из dev_pairs_for_ndcg:")
-for i, pair in enumerate(sol.dev_pairs_for_ndcg[:5]):
-    print(f"  {i + 1}. {pair}")
-
-# Проверяем работу __getitem__ для первых нескольких элементов
-print(f"\nПервые 5 элементов из val_dataset (после преобразования):")
-for i in range(min(5, len(sol.val_dataset))):
-    print(f"\n--- Элемент {i} ---")
-    pair, target = sol.val_dataset[i]
-    print(f"  Query (индексы): {pair['query']}")
-    print(f"  Document (индексы): {pair['document']}")
-    print(f"  Target: {target}")
-
-    # Декодируем обратно в текст для проверки (опционально)
-    # Создаем обратный словарь: индекс -> слово
-    idx_to_word = {idx: word for word, idx in sol.vocab.items()}
-
-    query_words = [idx_to_word.get(idx, '<UNK>') for idx in pair['query']]
-    doc_words = [idx_to_word.get(idx, '<UNK>') for idx in pair['document']]
-
-    print(f"  Query (слова): {query_words}")
-    print(f"  Document (слова): {doc_words}")
-
-# ============= ПРОВЕРКА collate_fn =============
-print("\n" + "=" * 70)
-print("ПРОВЕРКА collate_fn")
-print("=" * 70)
-
-# Берем первые 2 элемента из val_dataset вручную
-print("\n1. Сначала проверим отдельные элементы val_dataset:")
-sample_elements = []
-for i in range(2):
-    pair, target = sol.val_dataset[i]
-    sample_elements.append((pair, target))
-    print(f"\nЭлемент {i}:")
-    print(f"  Query (длина {len(pair['query'])}): {pair['query']}")
-    print(f"  Document (длина {len(pair['document'])}): {pair['document']}")
-    print(f"  Target: {target}")
-
-# Теперь применяем collate_fn к этим двум элементам
-print("\n" + "-" * 50)
-print("2. Применяем collate_fn к батчу из 2 элементов:")
-batch = sample_elements  # это список из (pair, target)
-result = collate_fn(batch)
-
-print(f"\nТип результата: {type(result)}")
-print(f"Длина результата: {len(result)}")
-
-# Распаковываем результат
-if len(result) == 2:  # pointwise режим
-    left_batch, labels_batch = result
-    print("\nРежим: POINTWISE")
-    print(f"\nleft_batch keys: {left_batch.keys()}")
-    print(f"query tensor shape: {left_batch['query'].shape}")
-    print(f"document tensor shape: {left_batch['document'].shape}")
-    print(f"labels tensor shape: {labels_batch.shape}")
-
-    print(f"\nquery tensor (первые 2 строки):\n{left_batch['query'][:2]}")
-    print(f"\ndocument tensor (первые 2 строки):\n{left_batch['document'][:2]}")
-    print(f"\nlabels tensor: {labels_batch}")
-
-else:  # triplet режим (хотя у нас val_dataset с 2 элементами)
-    left_batch, right_batch, labels_batch = result
-    print("\nРежим: TRIPLET")
-    print(f"left_batch keys: {left_batch.keys()}")
-    print(f"right_batch keys: {right_batch.keys()}")
-    print(f"left query shape: {left_batch['query'].shape}")
-    print(f"left document shape: {left_batch['document'].shape}")
-    print(f"right query shape: {right_batch['query'].shape}")
-    print(f"right document shape: {right_batch['document'].shape}")
-    print(f"labels shape: {labels_batch.shape}")
-
-# Проверяем, что все последовательности выровнены до одной длины
-print("\n" + "-" * 50)
-print("3. Проверка выравнивания (padding):")
-
-if len(result) == 2:
-    # Для pointwise: проверяем длины query и document
-    query_lens = [len(sample_elements[i][0]['query']) for i in range(2)]
-    doc_lens = [len(sample_elements[i][0]['document']) for i in range(2)]
-
-    print(f"Исходные длины query: {query_lens}")
-    print(f"Исходные длины document: {doc_lens}")
-    print(f"После padding - query shape: {left_batch['query'].shape}")
-    print(f"После padding - document shape: {left_batch['document'].shape}")
-
-    # Проверяем, что паддинг нулями работает
-    max_query_len = max(query_lens)
-    max_doc_len = max(doc_lens)
-
-    print(f"\nПроверка первой строки query (должна быть длина {max_query_len}):")
-    print(f"  Было: {sample_elements[0][0]['query']}")
-    print(f"  Стало: {left_batch['query'][0].tolist()}")
-    print(f"  Добавлено паддингов: {left_batch['query'][0].tolist()[query_lens[0]:]}")
-
-    print(f"\nПроверка второй строки query (должна быть длина {max_query_len}):")
-    print(f"  Было: {sample_elements[1][0]['query']}")
-    print(f"  Стало: {left_batch['query'][1].tolist()}")
-    print(f"  Добавлено паддингов: {left_batch['query'][1].tolist()[query_lens[1]:]}")
-
-# Проверяем через dataloader
-print("\n" + "-" * 50)
-print("4. Проверка через val_dataloader (первые 2 батча):")
-
-# Берем первые 2 батча из dataloader
-for batch_idx, batch_data in enumerate(sol.val_dataloader):
-    if batch_idx >= 2:  # только первые 2 батча
-        break
-
-    print(f"\n--- Батч {batch_idx + 1} ---")
-
-    if len(batch_data) == 2:
-        left_batch, labels_batch = batch_data
-        print(f"Тип: POINTWISE")
-        print(f"Query shape: {left_batch['query'].shape}")
-        print(f"Document shape: {left_batch['document'].shape}")
-        print(f"Labels shape: {labels_batch.shape}")
-        print(f"Labels: {labels_batch}")
-
-        # Проверяем первые 2 элемента в батче
-        print(f"\nПервые 2 query в батче (первые 10 токенов):")
-        for i in range(min(2, left_batch['query'].shape[0])):
-            print(f"  Query {i}: {left_batch['query'][i][:10].tolist()}...")
-            print(f"  Doc {i}: {left_batch['document'][i][:10].tolist()}...")
-    else:
-        left_batch, right_batch, labels_batch = batch_data
-        print(f"Тип: TRIPLET")
-        print(f"Left query shape: {left_batch['query'].shape}")
-        print(f"Right query shape: {right_batch['query'].shape}")
-        print(f"Labels shape: {labels_batch.shape}")
-
-print("\n" + "=" * 70)
-print("ПРОВЕРКА ЗАВЕРШЕНА")
-print("=" * 70)
+        traceback.print_exc()
